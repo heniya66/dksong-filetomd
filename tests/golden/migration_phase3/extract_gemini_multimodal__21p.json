@@ -1,0 +1,25 @@
+{
+  "_comment": "고정 골든 fixture — 통합 직전 원본에서 박제됨. 수동 편집 금지. 재생성: .venv/bin/python -m tests._golden_fixtures",
+  "source_ref": "5b2b0a835e9c1734872442b981b7949b690fc6c8",
+  "script": "extract_gemini_multimodal.py",
+  "entry_fn": "process_pdf",
+  "argv": null,
+  "total_pages": 21,
+  "snapshot": {
+    "calls": [
+      [
+        "Extract the full content of pages 1 to 20 from this PDF. Output in high-quality Markdown, preserving all text structure and tables (GFM pipe format). CRITICAL: For any images, diagrams, charts, or graphs, perform a highly detailed visual analysis. Describe the overall layout, visual elements, data trends, X/Y axis values, relationships, and core concepts. Write the image descriptions within Markdown blockquotes (>). IMPORTANT: All extracted text and image descriptions MUST be written in fluent Korean. Ensure all information is transcribed accurately.",
+        1,
+        20
+      ],
+      [
+        "Extract the full content of pages 21 to 21 from this PDF. Output in high-quality Markdown, preserving all text structure and tables (GFM pipe format). CRITICAL: For any images, diagrams, charts, or graphs, perform a highly detailed visual analysis. Describe the overall layout, visual elements, data trends, X/Y axis values, relationships, and core concepts. Write the image descriptions within Markdown blockquotes (>). IMPORTANT: All extracted text and image descriptions MUST be written in fluent Korean. Ensure all information is transcribed accurately.",
+        21,
+        21
+      ]
+    ],
+    "output_path": "output/pdf_md/gemini.md",
+    "separator": "\n\n---\n\n",
+    "chunk_count": 2
+  }
+}

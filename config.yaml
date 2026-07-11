@@ -1,0 +1,143 @@
+# filestomd - Multimodal Converter Configuration
+# -------------------------------------------------------
+# 우선순위: env > config.yaml > 코드기본값 (lib/config.py 로더가 이 파일을 1회 로드).
+# 환경변수가 항상 1순위. 이 파일의 값을 바꾸면 env 미설정 시 동작에 반영됨.
+# 시크릿(OLLAMA_API_KEY / GEMINI_API_KEY)은 이 파일에 절대 기록 금지 — Keychain SSoT.
+# 추출 provider — 하드 로컬 전환(2026-06-30, 사용자 명시 지시): 멀티모달 추출은
+# 로컬 ollama serve 게이트웨이(localhost:11434/v1) + 로컬 모델(qwen3-vl:32b)로만 동작.
+# 외부 cloud 연결은 코드 가드(ollama_extractor._resolve_provider / _guard_local_model /
+# _guard_local_base_url)로 원천 차단됨 — EXTRACT_PROVIDER=gemini 를 줘도 로컬로 흡수되고,
+# cloud 모델명(:cloud / gemini-*)·비-localhost base_url 은 차단/치환된다.
+# (구) gemini File API fallback 경로는 비활성(아래 gemini_fallback_model 주석 참조).
+
+# Supported formats and their input/output directory mapping
+formats:
+  pdf:
+    input_dir: input/pdf
+    output_dir: output/pdf_md
+  docx:
+    input_dir: input/docx
+    output_dir: output/docx_md
+  pptx:
+    input_dir: input/pptx
+    output_dir: output/pptx_md
+  xlsx:
+    input_dir: input/xlsx
+    output_dir: output/xlsx_md
+  hwp:
+    input_dir: input/hwp
+    output_dir: output/hwp_md
+  image:
+    input_dir: input/image
+    output_dir: output/image_md
+
+# Multimodal Processing Options
+options:
+  provider: ollama_cloud       # 로컬 전용(localhost 게이트웨이). 'gemini' 지정해도 코드 가드가 로컬로 흡수(외부 차단)
+  model: qwen3-vl:8b-instruct-q8_0  # 로컬 vision 모델(하드 로컬). FIX D-R2(2026-07-09 Advisor QA): qwen3-vl:32b 삭제(404)·qwen2.5vl:32b CLIP손상(500) → 신규 설치·실측 4.5s VISION_OK. env OLLAMA_VISION_MODEL로 override 가능(단 cloud 모델명은 가드가 차단/치환)
+  gemini_fallback_model: gemini-2.5-pro  # [비활성] 하드 로컬 전환(2026-06-30)으로 gemini File API 경로 차단됨 — 미사용(참고용 보존)
+  chunk_size: 5                # Pages per chunk (env EXTRACT_CHUNK_SIZE) — 기본 5: silent truncation 방지(무결성)
+  rate_limit_s: 10.0           # 청크 간 sleep 초수 (env EXTRACT_RATE_LIMIT_S) — convert_pdf 기본
+  render_dpi: 150              # 추출 경로 페이지 PNG 렌더 DPI (env EXTRACT_RENDER_DPI)
+  vision_qa_dpi: 220           # vision-QA 경로 렌더 DPI (env VISION_QA_DPI > EXTRACT_RENDER_DPI)
+  max_tokens: 8192             # thinking 모델 대응 최대 토큰 (env OLLAMA_CLOUD_MAX_TOKENS)
+  resume: true                 # 대용량 PDF resume(중단 후 이어받기) 캐시 (env EXTRACT_RESUME). 완료 청크 skip+이어받기. 0/false/no/off 로 끄면 기존 동작 동일
+  resume_keep_cache: false     # 전체 성공 시 resume 캐시 보존 여부 (env EXTRACT_RESUME_KEEP). 기본=성공 시 정리
+
+# Ollama Cloud 로컬 게이트웨이 (localhost — Authorization 헤더 불필요)
+ollama_cloud:
+  base_url: http://localhost:11434/v1  # env OLLAMA_BASE_URL > OLLAMA_CLOUD_BASE_URL
+  timeout: 600                 # 단일 호출 timeout(초) (env OLLAMA_CLOUD_TIMEOUT)
+  max_retries: 4               # 재시도 최대 횟수 (env OLLAMA_MAX_RETRIES)
+  retry_base_delay: 1.0        # 지수 백오프 기저(초) (env OLLAMA_RETRY_BASE_DELAY)
+  retry_max_delay: 60.0        # 계산 백오프 상한(초) (env OLLAMA_RETRY_MAX_DELAY)
+  retry_after_cap: 120.0       # Retry-After 헤더 절대 상한(초) (env OLLAMA_RETRY_AFTER_CAP)
+
+# Vision QA (2차 Claude Vision 검증 — 기본 OFF, VISION_QA=claude_cli 로 활성)
+vision_qa:
+  enabled: false               # env VISION_QA=claude_cli 로 활성
+  model: ""                    # claude CLI verifier 모델 (env VISION_QA_MODEL, 기본=CLI기본)
+  claude_bin: claude           # claude CLI 실행파일 (env VISION_QA_CLAUDE_BIN)
+  timeout: 600                 # verifier 호출 timeout(초) (env VISION_QA_TIMEOUT)
+  dpi: 220                     # verifier PNG 렌더 DPI (vision_qa_dpi 와 동일 계열)
+  # [M-9 보안] claude CLI verifier 는 전역 Read 권한이라(--add-dir 는 jail 아님)
+  #   신뢰 안 된 PDF 에서 프롬프트 인젝션으로 로컬 파일이 노출될 수 있다.
+  trusted: false               # env VISION_QA_TRUSTED=1 — 신뢰 입력일 때만 claude_cli 활성(강제 게이트). 미설정 시 claude_cli 자동 비활성.
+  sandbox_profile: ""          # env VISION_QA_SANDBOX_PROFILE — "auto"(blocklist 자동생성) 또는 .sb 파일경로. 설정 시 sandbox-exec 로 민감 디렉터리 Read 를 OS 차단(보조 완화, 완전 jail 아님). 미설정 시 미적용.
+  sandbox_deny: ""             # env VISION_QA_SANDBOX_DENY — sandbox=auto 시 추가 deny 절대경로(콜론 구분).
+
+# 도메인(domain) → 본문 전사 vision 모델 라우팅 (2026-06-25)
+# -------------------------------------------------------
+# convert_project 가 도메인별 변환 시 EXTRACT_DOMAIN 을 subprocess 로 주입하면, 그 도메인의
+# 본문 전사(extract_pdf_pages/extract_image) vision 모델을 여기 매핑으로 자동 선택한다.
+# 실측(원격 M4 Max): 표·텍스트(datasheet/특성표)는 glm-ocr(0.9B)이 8~9초 정확 OCR
+# (qwen3-vl 32B 는 258초·32배 느림). 회로도·도면은 qwen3-vl:32b 만 그림을 해석(축/핀/구조).
+# ★ figure bbox 검출(detect_figures_llm)에는 적용 안 됨 — 도면 검출은 항상 구조 모델(qwen) 유지
+#   (GLM-OCR 은 JSON bbox 프롬프트 미준수 위험). 도메인 라우팅은 '본문 전사' 경로 한정.
+#
+# 우선순위(모델 결정): env FMDW_DOMAIN_MODEL_<DOMAIN> > 이 맵 > 코드 기본 매핑 > options.model 폴백.
+# 빈 문자열/미설정/미매핑 도메인은 options.model(기본 vision 모델)로 폴백 → 회귀 0.
+# 아래는 코드 기본 매핑과 동일(주석 처리). 바꾸려면 주석 해제 후 값 수정.
+# domain_models:
+#   datasheet:   glm-ocr        # 표·텍스트 고속 OCR
+#   reference:   glm-ocr        # 일반 텍스트 문서
+#   schematic:   ""             # 도면 해석 필요 → 기본 vision 모델(qwen 계열) 폴백
+#   design_doc:  ""             # 〃
+#   source_code: ""             # 텍스트 래핑 수집(vision 무관) → 기본 폴백
+
+# 본문 하이브리드 전사(body hybrid transcription, 2026-07-04)
+# -------------------------------------------------------
+# ⚠️ 이 값들도 위 domain_models/figures 와 동일하게 "문서화용 참고값" — 실제 제어는
+# extract_all_via_pdf.py 가 os.getenv() 로 직접 읽는다(이 yaml 은 소비 안 함). 전역
+# 기본 ON 은 run_local_convert.sh 의 env export 가 SSoT.
+# 실측(LN08LPU Design Manual testpages): 도메인 라우팅으로 datasheet 에 glm-ocr 을 쓰면
+# 8~9초/페이지로 빠르고 표/본문 정확도가 높지만, 표지·법적고지(Important Notice)·목차
+# 머리말 같은 페이지를 조용히 스킵한다(에러 없이 빈 출력). qwen3-vl:32b 는 지시를 그대로
+# 따라 전부 전사하지만 조밀한 페이지에서 10~26분/페이지로 느려 문서 전체 적용은 비현실
+# 적이다. 페이지별로 glm 을 먼저 시도하고, 그 페이지의 selectable 텍스트(pdf_text_len)
+# 대비 glm 출력이 너무 짧으면(커버리지 미달) "스킵됨"으로 간주해 그 페이지만 qwen 으로
+# 재전사(repair)한다 — 표처럼 glm 이 잘 처리하는 조밀한 페이지는 출력이 충분히 길어
+# 폴백이 트리거되지 않는다(빠른 속도 유지).
+# body_hybrid:
+#   enabled: false                       # env FMDW_BODY_HYBRID=1 (코드 기본 off; run_local_convert.sh 는 1 로 기본 ON)
+#   primary_model: glm-ocr               # env FMDW_BODY_PRIMARY_MODEL — 1차: 빠른 OCR
+#   fallback_model: glm-ocr              # env FMDW_BODY_FALLBACK_MODEL — 폴백: 스킵 페이지 재전사 (R1 2026-07-09: 기본 glm-ocr)
+#   coverage_min: 0.30                   # env FMDW_HYBRID_COVERAGE_MIN — glm출력 < 이 비율×pdf텍스트 → 폴백 트리거
+#   min_text: 120                        # env FMDW_HYBRID_MIN_TEXT — 이 미만 pdf_text_len 은 이미지위주 페이지로 간주(오탐 방지 가드, 폴백 미트리거)
+
+# 앙상블(ensemble) 모드 — N개 vision 모델 병렬 추출 → merger 모델 병합·교차검증 (2026-06-25)
+# -------------------------------------------------------
+# 같은 페이지를 여러 모델(예: qwen3-vl 상세 + gemma4 보완)로 각각 전사한 뒤, merger 모델이
+# 텍스트로 비교·병합해 ① 통합본(누락 0) ② 상호 보완/불일치 항목을 만든다. 한 모델이 놓친
+# 정보·환각을 교차검증으로 잡는다(실측 보완 ~18%). 비용이 크므로(병합 포함 ~4배) **중요
+# 문서에만** 켜는 opt-in. 적용 범위 = 본문 전사(role='structure')만 — figure 검출/캡션은
+# 단일 유지(비용·복잡도 관리). 모델 1개만 지정하면 사실상 단일(병합 skip, graceful).
+#
+# 활성: --ensemble (convert_project) 또는 env EXTRACT_ENSEMBLE=1. 미설정 시 기존 단일
+#       동작과 byte-identical(회귀 0). 모델/merger 는 env(FMDW_ENSEMBLE_MODELS,
+#       FMDW_ENSEMBLE_MERGER) 또는 아래 yaml 로 지정. 기본 off.
+# 우선순위: env > 아래 yaml > 코드기본값(models=[qwen3-vl:32b, gemma4:31b], merger=qwen3-vl:32b).
+# ensemble:
+#   enabled: false                       # env EXTRACT_ENSEMBLE (기본 off)
+#   models:                              # env FMDW_ENSEMBLE_MODELS (콤마 구분) 우선
+#     - qwen3-vl:32b                     #   상세 전사
+#     - gemma4:31b                       #   보완·교차검증
+#   merger: qwen3-vl:32b                 # env FMDW_ENSEMBLE_MERGER — 두/N 결과 병합 모델
+
+# figure/복잡표 크롭·설명 옵션 (2026-07-03)
+# -------------------------------------------------------
+# ⚠️ vision_qa 섹션과 동일하게 이 값들은 실제 제어가 env 로만 이뤄지는 opt-in 토글의
+# "문서화용 참고값"이다(fmdw/figure_extractor.py 가 os.getenv() 를 직접 읽음 — 이 yaml 은
+# 소비하지 않는다). 전역 기본 ON 은 run_local_convert.sh 의 env export 가 SSoT.
+# 실측(2026-07-03, LN08LPU Design Manual testpages): p11~13 "Table 21: Design Truth
+# Table"(~50열×~60행)은 벡터 격자선이 없는 순수 raster 이미지로 삽입돼 있어 사선표 경로
+# (diagonal_table)로는 검출 불가 — px 밀도(4.4~6.9)·점유율(0.32~0.51) 기반의 독립 경로
+# (oversized_matrix_tables)로만 검출된다. p10(Metallization Stack, 실제 벡터/텍스트 표,
+# ~11열)은 두 경로 모두에서 검출되지 않아야 정상(GFM 표로 전사).
+figures:
+  diagonal_tables: true                  # env EXTRACT_DIAGONAL_TABLE=1 — 사선/비정형 표 → 이미지(코드 기본 OFF)
+  oversized_matrix_tables: true          # env EXTRACT_OVERSIZED_MATRIX_TABLES=1 — raster 오버사이즈 행렬표 → 이미지(코드 기본 OFF)
+  oversized_matrix_min_density: 3.5      # env EXTRACT_OVERSIZED_IMG_MIN_DENSITY — 최소 px밀도(px/pt, 짧은 축)
+  oversized_matrix_min_cover: 0.30       # env EXTRACT_OVERSIZED_IMG_MIN_COVER — 최소 페이지 점유율
+  describe_complex_tables: true          # env EXTRACT_DESCRIBE_COMPLEX_TABLES=1 — 전역 describe OFF 여도 complex_table 은 설명 생성(코드 기본 OFF)
+  figure_desc_max_tokens_complex: 16384  # env EXTRACT_FIGURE_DESC_MAX_TOKENS_COMPLEX — complex_table describe 전용 max_tokens(일반 figure 는 8192 유지)

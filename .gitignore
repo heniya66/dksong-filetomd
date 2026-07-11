@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# 입출력 데이터 (대용량 — 코드 외 산출물)
+input/
+output/
+*.pdf
+
+# 임시/백업
+temp_*/
+**/temp_*/
+*.bak
+*.bak_*
+.DS_Store
+
+# 시크릿 (Keychain SSoT — 평문 금지)
+.env
+.env.*
+*.key
+*.pem
+
+# 프레임워크/도구 상태 (프로젝트 코드 아님)
+.agents/
+.bkit/
+.gemini/
+.omc/
+.obsidian/
+.claude/
+.pdca-status.json
+
+# 루트 임시 작업 스크립트
+/_crop_tmp.py
+/_qa_crop.py
+
+# 일회성 PoC 스크립트 (운영 로직은 lib/figure_extractor.py 로 승격됨)
+/scripts/poc_figure_crop.py
+
+# 세션 백업 디렉토리 (코드 아님, 2026-07-11)
+_pre_*/
+_*_backup_*/
+_straddle_backups_*/
+_leakguard_backup_*/
+_disabled*/
+_bad_*/
+_curated_*/
+logs/
+*.log

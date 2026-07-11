@@ -1,0 +1,25 @@
+{
+  "_comment": "고정 골든 fixture — 통합 직전 원본에서 박제됨. 수동 편집 금지. 재생성: .venv/bin/python -m tests._golden_fixtures",
+  "source_ref": "fbb61dc",
+  "script": "extract_eda_pyojun.py",
+  "entry_fn": "main",
+  "argv": null,
+  "total_pages": 40,
+  "snapshot": {
+    "calls": [
+      [
+        "PDF 페이지 1~20 전체를 고품질 Markdown으로 추출하라.\n\n- 페이지 헤더: `## Page N` (실제 PDF(Portable Document Format) 페이지번호, 리셋 금지)\n- 모든 텍스트·표(GFM(GitHub Flavored Markdown) pipe, 셀 생략 금지)·번호·서식 보존\n- 이미지(다이어그램/블록도/플로우차트/그래프/스크린샷/표이미지/시스템도/타임라인)가 등장하는 본문 위치에 인라인 분석 삽입:\n\n> **[이미지 N · <유형>]**\n> **제목/캡션**: ... / **유형 식별**: ...\n> **상세 분석**: (한 그림을 하나의 단위로 종합 서술 — 구성요소를 개별 블록으로 쪼개지 말 것. 위치·흐름·축·범례·식별번호)\n> **포함된 텍스트/라벨**: 내부 텍스트 OCR(Optical Character Recognition) 전사\n> **본문 연계**: ...\n\n- 한 그림이 슬라이스/조각나도 1개 블록으로 통합. 로고/헤더/푸터/배경음영은 figure 아님.\n- 표 배경 음영은 표 → GFM(GitHub Flavored Markdown) 표로 추출.\n- 색상 의미 명시.\n",
+        1,
+        20
+      ],
+      [
+        "PDF 페이지 21~40 전체를 고품질 Markdown으로 추출하라.\n\n- 페이지 헤더: `## Page N` (실제 PDF(Portable Document Format) 페이지번호, 리셋 금지)\n- 모든 텍스트·표(GFM(GitHub Flavored Markdown) pipe, 셀 생략 금지)·번호·서식 보존\n- 이미지(다이어그램/블록도/플로우차트/그래프/스크린샷/표이미지/시스템도/타임라인)가 등장하는 본문 위치에 인라인 분석 삽입:\n\n> **[이미지 N · <유형>]**\n> **제목/캡션**: ... / **유형 식별**: ...\n> **상세 분석**: (한 그림을 하나의 단위로 종합 서술 — 구성요소를 개별 블록으로 쪼개지 말 것. 위치·흐름·축·범례·식별번호)\n> **포함된 텍스트/라벨**: 내부 텍스트 OCR(Optical Character Recognition) 전사\n> **본문 연계**: ...\n\n- 한 그림이 슬라이스/조각나도 1개 블록으로 통합. 로고/헤더/푸터/배경음영은 figure 아님.\n- 표 배경 음영은 표 → GFM(GitHub Flavored Markdown) 표로 추출.\n- 색상 의미 명시.\n",
+        21,
+        40
+      ]
+    ],
+    "output_path": "/Users/heni/workspace/filestomdwgem/output/pdf_md/EDA 실행 표준 구조.md",
+    "separator": "\n\n---\n\n",
+    "chunk_count": 2
+  }
+}

@@ -1,0 +1,52 @@
+# filestomdwgem — 가벼운 패키지화 (외부 프로젝트에서 `pip install -e` 후 import).
+#
+# 패키지 본체는 루트의 `fmdw/` 디렉토리(src layout 미사용).
+# 외부 사용 예:
+#   pip install -e /path/to/filestomdwgem
+#   from fmdw.pdf_pipeline import convert_pdf
+#
+# 의존성은 requirements.txt(재현 빌드/SBOM 매니페스트)와 동기화한다.
+# - 핵심 런타임: PyYAML / httpx / pymupdf / python-docx / lxml
+# - Gemini SDK fallback(google-generativeai)은 opt-in extra(`[gemini]`)로 분리
+#   (EXTRACT_PROVIDER=gemini 일 때만 필요, 지연 import).
+
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "filetomd"
+version = "0.1.0"
+description = "PDF/DOCX → Markdown 멀티모달 추출 파이프라인 (Ollama Cloud 게이트웨이 기본, Gemini fallback)."
+readme = "GEMINI_MULTIMODAL_MANUAL.md"
+requires-python = ">=3.10"
+license = { text = "Proprietary" }
+
+# 핵심 런타임 의존성 — requirements.txt 의 실제 패키지 핀 범위와 동기화.
+dependencies = [
+    "PyYAML>=6,<7",          # fmdw/config.py: config.yaml 파싱
+    "httpx>=0.27,<1",        # fmdw/ollama_extractor.py: Ollama Cloud 게이트웨이 HTTP
+    "pymupdf>=1.24,<2",      # fitz: PDF 렌더/페이지수
+    "python-docx>=1.1,<2",   # docx.Document: DOCX 텍스트/표 추출
+    "lxml>=5,<7",            # python-docx 의 DOCX(OOXML) 파싱 하드 의존
+]
+
+[project.optional-dependencies]
+# opt-in: gemini fallback (EXTRACT_PROVIDER=gemini 일 때만 필요, 지연 import).
+gemini = ["google-generativeai>=0.8,<0.9"]
+# opt-in: office/web 포맷 변환 (docx/pptx/xlsx/xls/html/htm/csv) — markitdown 경유.
+#   fmdw.markitdown_pipeline 의 지연 import(markitdown)로만 사용. 미설치 시 사용
+#   시점에 친절한 ImportError. 핵심 의존성에는 넣지 않는다(무겁다).
+office = ["markitdown[docx,pptx,xlsx]>=0.1.6"]
+# opt-in: hwp/hwpx 변환 — pyhwp2md(MIT) 경유. fmdw.hwp_pipeline 의 지연 import.
+#   pyhwp 계열은 베타라 환경에 따라 설치/동작 실패 가능(미설치 시 graceful ImportError).
+hwp = ["pyhwp2md>=0.1.2"]
+
+[tool.setuptools]
+# 루트의 fmdw 패키지만 배포 (extract_*.py / scripts / tests 는 패키지 외부 유지).
+packages = ["fmdw"]
+
+[tool.setuptools.package-data]
+# config.yaml 은 패키지 외부(워크스페이스 루트)에 있으므로 package-data 미포함.
+# 외부 프로젝트는 FMDW_CONFIG 환경변수로 자기 config.yaml 을 주입한다.
+fmdw = []

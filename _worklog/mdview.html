@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>문서 보기</title>
+<script src="/_worklog/vendor/marked.min.js"></script>
+<style>
+  /* 다크모드: 검정 배경 · 밝은 글자 */
+  :root{ --fg:#f5f5f5; --muted:#b8c0c8; --border:#30363d; --bg:#000000; --panel:#161b22; --accent:#58a6ff; }
+  *{box-sizing:border-box;}
+  html,body{background:#000; }
+  body{margin:0; color:var(--fg);
+       font-family:-apple-system,BlinkMacSystemFont,"Apple SD Gothic Neo","Malgun Gothic",Segoe UI,Roboto,sans-serif;
+       line-height:1.65;}
+  .topbar{position:sticky; top:0; z-index:10; background:#0a0a0a; border-bottom:1px solid var(--border);
+          padding:10px 18px; display:flex; align-items:center; gap:14px; flex-wrap:wrap;}
+  .topbar .fname{font-weight:700; font-size:15px; word-break:break-all; color:#fff;}
+  .topbar .path{color:var(--muted); font-size:12px; word-break:break-all;}
+  .topbar a{color:var(--accent); text-decoration:none; font-size:13px; border:1px solid var(--border);
+            padding:4px 10px; border-radius:6px; background:#161b22; white-space:nowrap;}
+  .topbar a:hover{background:#21262d;}
+  .wrap{max-width:920px; margin:24px auto; background:var(--bg); border:1px solid var(--border);
+        border-radius:10px; padding:32px 44px; box-shadow:0 1px 3px rgba(0,0,0,.5);}
+  .md{color:var(--fg);}
+  .md h1{font-size:1.9em; border-bottom:1px solid var(--border); padding-bottom:.3em; margin-top:0; color:#fff;}
+  .md h2{font-size:1.5em; border-bottom:1px solid var(--border); padding-bottom:.3em; margin-top:1.6em; color:#fff;}
+  .md h3{font-size:1.22em; margin-top:1.4em; color:#fff;}
+  .md h4{font-size:1.05em; color:#fff;}
+  .md code{background:#21262d; color:#e6edf3; padding:.15em .4em; border-radius:5px; font-size:.88em;
+           font-family:"SF Mono",Menlo,Consolas,monospace;}
+  .md pre{background:#161b22; border:1px solid var(--border); padding:14px 16px; border-radius:8px; overflow:auto;}
+  .md pre code{background:none; padding:0;}
+  .md table{border-collapse:collapse; margin:14px 0; display:block; overflow:auto; max-width:100%;}
+  .md th,.md td{border:1px solid var(--border); padding:7px 13px; text-align:left;}
+  .md th{background:#161b22; font-weight:700; color:#fff;}
+  .md tr:nth-child(2n){background:#11161d;}
+  .md blockquote{margin:14px 0; padding:0 16px; color:var(--muted); border-left:4px solid var(--border);}
+  .md img{max-width:100%;}
+  .md a{color:var(--accent); text-decoration:none;}
+  .md a:hover{text-decoration:underline;}
+  .md hr{border:0; border-top:1px solid var(--border); margin:24px 0;}
+  .md strong{color:#fff;}
+  .err{color:#ff7b72; padding:24px; font-weight:600;}
+</style>
+</head>
+<body>
+<div class="topbar">
+  <div>
+    <div class="fname" id="fname">문서 로딩 중…</div>
+    <div class="path" id="fpath"></div>
+  </div>
+  <div style="margin-left:auto; display:flex; gap:8px;">
+    <a id="rawlink" href="#" target="_blank">📄 원본(raw)</a>
+    <a href="javascript:history.back()">← 뒤로</a>
+  </div>
+</div>
+<div class="wrap"><div class="md" id="content">로딩 중…</div></div>
+<script>
+(function(){
+  function qs(name){
+    var m = new RegExp('[?&]'+name+'=([^&]+)').exec(location.search);
+    return m ? decodeURIComponent(m[1]) : null;
+  }
+  var path = qs('path');
+  var content = document.getElementById('content');
+  if(!path){ content.innerHTML = '<div class="err">path 파라미터가 없습니다.</div>'; return; }
+  var fname = path.split('/').pop();
+  document.getElementById('fname').textContent = fname;
+  document.getElementById('fpath').textContent = path;
+  document.title = fname;
+  document.getElementById('rawlink').href = path;
+  fetch(path).then(function(r){
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    return r.text();
+  }).then(function(text){
+    if(window.marked){
+      marked.setOptions({ gfm:true, breaks:false });
+      content.innerHTML = marked.parse(text);
+    } else {
+      var pre=document.createElement('pre'); pre.textContent=text; content.innerHTML=''; content.appendChild(pre);
+    }
+  }).catch(function(e){
+    content.innerHTML = '<div class="err">문서를 불러오지 못했습니다: '+e.message+
+      '<br><br><a href="'+path+'">원본 직접 열기</a></div>';
+  });
+})();
+</script>
+</body>
+</html>

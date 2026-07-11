@@ -1,0 +1,33 @@
+# filestomdwgem 의존성 (H-7 매니페스트 신설/보강)
+# env > config.yaml > 코드기본값 우선순위로 동작하는 config SSoT 로더에 필요.
+#
+# 핀 범위는 .venv 설치본 기준(2026-06-04): PyYAML 6.0.3 / httpx 0.28.1 /
+# PyMuPDF 1.27.2.3 / python-docx 1.2.0 / lxml 6.1.1 / google-genai 2.6.0 /
+# google-generativeai 0.8.6. 설치 시: pip install -r requirements.txt
+# (.venv 사용). 재현 빌드/pip-audit/safety 용 매니페스트.
+#
+# 설치 검증: .venv/bin/python -m pip install -r requirements.txt
+PyYAML>=6,<7              # lib/config.py: yaml — config.yaml 파싱
+
+# 핵심 런타임 의존성 (실제 import 확인된 것만 핀 고정)
+httpx>=0.27,<1            # lib/ollama_extractor.py:49 — Ollama Cloud 게이트웨이 HTTP
+pymupdf>=1.24,<2          # fitz — PDF 렌더/페이지수 (ollama_extractor, page_tier, scripts/*)
+python-docx>=1.1,<2      # docx.Document — extract_docx_multimodal.py:5 (DOCX 텍스트/표 추출)
+lxml>=5,<7               # python-docx 가 DOCX(OOXML) 파싱에 사용하는 하드 의존(명시 핀: pip-audit/SBOM 가시화)
+
+# ── opt-in fallback (EXTRACT_PROVIDER=gemini 일 때만 필요) ──────────────────
+# 기본 추출 경로(ollama_cloud)는 위 핀만으로 동작. Gemini SDK fallback은
+# lib/ollama_extractor.py 의 지연 import(google.generativeai)로만 사용되며,
+# 롤백/품질 비교용으로만 보존된다. fallback 비활성 시 설치 불필요.
+#   pip install google-generativeai
+google-generativeai>=0.8,<0.9   # opt-in: gemini fallback (lib/ollama_extractor.py:455,485,584)
+
+# ── opt-in: 다포맷 변환 extras (핵심 의존성 아님 — 선택 설치) ────────────────
+# office/web 포맷(docx/pptx/xlsx/xls/html/htm/csv)은 fmdw.markitdown_pipeline 가
+# markitdown 을 지연 import 한다. hwp/hwpx 는 fmdw.hwp_pipeline 가 pyhwp2md 를
+# 지연 import 한다. 둘 다 미설치 시 사용 시점에만 친절한 ImportError(기존 경로 무영향).
+# 설치:
+#   pip install 'filestomdwgem[office]'   # 또는: markitdown[docx,pptx,xlsx]>=0.1.6
+#   pip install 'filestomdwgem[hwp]'      # 또는: pyhwp2md>=0.1.2 (pyhwp 베타 — 실패 가능)
+# markitdown[docx,pptx,xlsx]>=0.1.6   # opt-in: office/web 변환 (fmdw/markitdown_pipeline.py)
+# pyhwp2md>=0.1.2                     # opt-in: hwp/hwpx 변환 (fmdw/hwp_pipeline.py)
