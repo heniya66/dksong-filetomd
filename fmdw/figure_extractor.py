@@ -405,6 +405,240 @@ def detect_oversized_matrix_tables(
     return out
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Fix1 (Phase2, 2026-07-12): 테두리 없는 초광폭 dense 수치표(벡터 텍스트) 검출.
+#
+# 배경(Phase1 근본원인 = 검출 recall 갭): detect_complex_tables(벡터 사선표)+
+# detect_oversized_matrix_tables(raster 삽입 이미지 표)는 '표 전체가 벡터 텍스트인
+# 초광폭 수치 매트릭스'(예 DM_p1274 biasing 매트릭스 ~25~27열, HS 광폭 delta표)를
+# 놓친다 → 본문 vision LLM 이 GFM 전사하다 절단/셀뭉갬 발생(HS '... ...' 절단,
+# DM 34/27/26 열 오정렬). 이런 표는 find_tables 도 완전 격자를 못 잡아(부분 6행만)
+# GFM 무손실 전사가 불가능하므로, 정확한 크롭 이미지로 라우팅해야 한다.
+#
+# 판별(보수적·고정밀): 페이지 벡터 텍스트 span 의 x-시작 좌표를 열로 클러스터링해
+# '정렬 열 수(aligned_cols)'를 센다. 실측 판별력 — DM 매트릭스 aligned≈25~26 vs
+# 정상 표 최대 12(HS Table2 12열)·정상 페이지 ≤8 → 기본 임계 18 이 오검출 0 으로
+# 분리한다. numeric/짧은토큰 비율·행수·페이지 점유율 가드로 산문/소표를 추가 배제.
+# ──────────────────────────────────────────────────────────────────────────────
+
+_DENSE_NUMERICISH_RE = re.compile(r"^[-+]?[\d.,<>=≤≥%/()µ]+$")
+
+
+def _is_oversized_vector_enabled() -> bool:
+    """FMDW_OVERSIZED_VECTOR(기본 ON). 끄면 벡터 dense 표 검출을 완전히 비활성(롤백용).
+    상위 게이트는 EXTRACT_OVERSIZED_MATRIX_TABLES(자동 라우팅 진입 조건)."""
+    return os.getenv("FMDW_OVERSIZED_VECTOR", "1").strip().lower() not in (
+        "0", "false", "no", "off")
+
+
+# -- >=18 정렬열 표는 테두리 유무와 무관하게 이미지 크롭(Minor#3 근거, 동작 유지) --
+#   GFM(GitHub Flavored Markdown) 표는 열이 늘수록 파이프(|) 셀이 가로로 폭주해 사람·
+#   LLM 모두 행/열 대응을 잃는다(가독성 실질 붕괴). 정상 데이터시트 표는 최대 12열(HS
+#   Table2)·일반 페이지 <=8열인 반면, DM 바이어싱 매트릭스는 25~26열 -> 임계 18 이 둘을
+#   분리한다. 테두리가 '있어도' 정렬열이 >=18 이면 동일하게 이미지화하는 것은 의도된
+#   동작이다: GFM 표현 가능성의 실제 제약은 테두리 유무가 아니라 '열 수(가독성)'이기
+#   때문(테두리 있는 광폭표를 GFM 로 밀어 넣던 mode-B 재발 방지). GFM 우선 예외는 두지
+#   않는다. 임계는 환경변수 FMDW_DENSE_VECTOR_COLS 로 조절(낮추면 공격적, 높이면 보수적).
+def _dense_vector_min_cols() -> int:
+    """정렬 열 수 임계(기본 18). 정상 표 최대 12 와 DM 매트릭스 25~26 사이 안전지대."""
+    try:
+        return int(os.getenv("FMDW_DENSE_VECTOR_COLS", "18"))
+    except ValueError:
+        return 18
+
+
+def _dense_short_or_numeric(tok: str) -> bool:
+    t = tok.strip()
+    if not t:
+        return False
+    return len(t) <= 6 or bool(_DENSE_NUMERICISH_RE.match(t))
+
+
+def detect_dense_vector_tables(page) -> list[list[float]]:
+    """테두리 없는 초광폭 dense 수치표(벡터 텍스트) bbox 리스트(PDF pt). 없으면 [].
+
+    결정론(LLM 비의존): ``page.get_text("words")`` 의 x-시작 좌표를 6pt 허용오차로 열
+    클러스터링하고, '≥40% 행에서 등장하는 정렬 열'을 aligned_cols 로 센다. 채택 조건
+    (모두 충족): aligned_cols>=_dense_vector_min_cols()(기본 18) 且 dense 행수>=6 且
+    numeric/짧은토큰 비율>=0.5 且 페이지 점유율>=0.3. bbox 는 정렬 격자에 참여한
+    dense 행 단어들의 바운딩박스(표 밖 제목/산문 미포함). 보수적 임계로 일반표 과이미지화 X.
+    """
+    if not _is_oversized_vector_enabled():
+        return []
+    try:
+        pw, ph = page.rect.width, page.rect.height
+    except Exception:  # noqa: BLE001
+        return []
+    if pw <= 0 or ph <= 0:
+        return []
+    try:
+        words = page.get_text("words")  # (x0,y0,x1,y1, word, block, line, wordno)
+    except Exception:  # noqa: BLE001
+        return []
+    if len(words) < 40:
+        return []
+    # 1) 행 클러스터링(y 3pt 버킷 → 인접 버킷 병합), 3단어 미만 행은 표 행 후보 제외.
+    buckets: dict[int, list] = {}
+    for w in words:
+        buckets.setdefault(int(round(w[1] / 3.0)), []).append(w)
+    ykeys = sorted(buckets)
+    rows: list[list] = []
+    cur: list = []
+    last = None
+    for k in ykeys:
+        if last is not None and k - last > 1:
+            if cur:
+                rows.append(cur)
+            cur = []
+        cur.extend(buckets[k])
+        last = k
+    if cur:
+        rows.append(cur)
+    row_words = [sorted(r, key=lambda w: w[0]) for r in rows if len(r) >= 3]
+    nrows = len(row_words)
+    if nrows < 6:
+        return []
+    # 2) x-시작 좌표 열 클러스터링(6pt 허용오차).
+    xs = sorted(round(w[0]) for r in row_words for w in r)
+    clusters: list[list[int]] = []
+    for x in xs:
+        if clusters and x - clusters[-1][-1] <= 6:
+            clusters[-1].append(x)
+        else:
+            clusters.append([x])
+    centroids = [sum(c) / len(c) for c in clusters]
+    # 3) 정렬 열 = ≥40% 행에서 그 x 근처(±6pt)에 단어 시작이 있는 열.
+    aligned_centroids = []
+    for cc in centroids:
+        hits = sum(1 for r in row_words if any(abs(w[0] - cc) <= 6 for w in r))
+        if hits / nrows >= 0.4:
+            aligned_centroids.append(cc)
+    aligned_cols = len(aligned_centroids)
+    if aligned_cols < _dense_vector_min_cols():
+        return []
+    # 4) numeric/짧은토큰 비율(산문 배제).
+    cells = [w[4] for r in row_words for w in r]
+    if not cells:
+        return []
+    num_ratio = sum(1 for c in cells if _dense_short_or_numeric(c)) / len(cells)
+    if num_ratio < 0.5:
+        return []
+    # 5) 표 행(정렬 열을 다수 채우는 행)으로 bbox 산정(표 밖 제목/산문 제외).
+    #    aligned_cols>=임계(18)가 오검출 방어의 본체이므로(정상표 최대 12열) 행수/점유율
+    #    가드는 '표가 실재함'만 확인하는 최소 sanity 로 완화한다(초광폭 매트릭스가 특정
+    #    페이지에서 소수 행만 차지(연속 페이지로 이어짐)해도 놓치지 않도록).
+    # '표 행' = 정렬 열을 다수(≥40%) 채우는 행. 40% 임계는 coincidental 정렬(캡션/제목
+    #   줄이 좌측 몇 열과 우연히 겹침)을 배제해 bbox 가 표 밖 헤딩/캡션까지 삼키지 않게 한다
+    #   (그렇지 않으면 _oversized_body_md 가 표 밖 본문을 통째로 잃는 회귀 발생).
+    need_hits = max(4, int(aligned_cols * 0.4))
+    table_words = []
+    table_rows = 0
+    for r in row_words:
+        hit = sum(1 for cc in aligned_centroids if any(abs(w[0] - cc) <= 6 for w in r))
+        if hit >= need_hits:
+            table_rows += 1
+            table_words.extend(r)
+    if table_rows < 4 or not table_words:
+        return []
+    x0 = min(w[0] for w in table_words)
+    y0 = min(w[1] for w in table_words)
+    x1 = max(w[2] for w in table_words)
+    y1 = max(w[3] for w in table_words)
+    box = _expand_box_with_grid(page, [x0, y0, x1, y1])
+    if _area_cover(box, pw, ph) < 0.10:
+        return []
+    return [box]
+
+
+def _boxes_overlap(a: list[float], b: list[float]) -> bool:
+    return not (a[2] <= b[0] or b[2] <= a[0] or a[3] <= b[1] or b[3] <= a[1])
+
+
+def _expand_box_with_grid(page, box: list[float]) -> list[float]:
+    """dense-vector 표 박스를 '겹치는 find_tables(격자) 표 bbox' 와 union 해, 표 자신의
+    헤더행(그룹헤더·회전 열헤더)까지 크롭에 포함시킨다. 표 밖 섹션 헤딩/캡션은 격자
+    경계 밖이라 union 에 포함되지 않아 표밖 본문(_oversized_body_md)에 그대로 남는다.
+    find_tables 실패/무결과 시 원본 word-bbox 유지(안전 degrade)."""
+    try:
+        tabs = page.find_tables()
+        tlist = list(getattr(tabs, "tables", []))
+    except Exception:  # noqa: BLE001
+        return box
+    x0, y0, x1, y1 = box
+    for t in tlist:
+        try:
+            b = list(t.bbox)
+        except Exception:  # noqa: BLE001
+            continue
+        if len(b) == 4 and _boxes_overlap(box, b):
+            x0, y0 = min(x0, b[0]), min(y0, b[1])
+            x1, y1 = max(x1, b[2]), max(y1, b[3])
+    return [x0, y0, x1, y1]
+
+
+def _dedup_boxes(boxes: list[list[float]], iou_thresh: float = 0.5) -> list[list[float]]:
+    """IoU>iou_thresh 로 겹치는 bbox 중복 제거(큰 것 우선 유지)."""
+    kept: list[list[float]] = []
+    for b in sorted(boxes, key=lambda b: (b[2] - b[0]) * (b[3] - b[1]), reverse=True):
+        if any(_iou(b, k) > iou_thresh for k in kept):
+            continue
+        kept.append(b)
+    return kept
+
+
+def _detect_oversized_tables_tagged(
+    page, exclude_xrefs: Optional[set[int]] = None
+) -> list[tuple[list[float], str]]:
+    """detect_oversized_tables 와 '동일한 박스 집합'을 반환하되 각 박스에 검출 경로
+    출처 라벨을 붙인다(사이드카 source 필드 정확화, Minor#1 Phase2).
+
+      - raster 행렬표(detect_oversized_matrix_tables, 삽입 이미지 표) -> "raster_density"
+      - 테두리 없는 벡터 dense 표(detect_dense_vector_tables, 열정렬 밀도) -> "vector_density"
+
+    우선순위 규칙(union/dedup 로 출처가 겹칠 때): raster_density 우선. 표 전체가 래스터
+    이미지로 삽입된 경우가 더 강한 결정적 신호이자 레거시 라벨과 일치하므로, 동일 영역
+    (IoU>0.5)을 두 경로가 함께 잡으면 raster_density 로 확정한다(벡터 검출은 보강 신호로
+    흡수). 박스 '기하'는 _dedup_boxes 와 완전 동일(면적 큰 것 우선 유지)로 보존 ->
+    크롭/bbox/figure_id/kind 불변, 바뀌는 것은 메타 source 라벨뿐."""
+    tagged: list[tuple[list[float], str]] = [
+        (b, "raster_density")
+        for b in (detect_oversized_matrix_tables(page, exclude_xrefs=exclude_xrefs) or [])
+    ]
+    try:
+        tagged += [(b, "vector_density") for b in (detect_dense_vector_tables(page) or [])]
+    except Exception:  # noqa: BLE001 - 벡터 검출 실패가 raster 경로를 막지 않게 안전 degrade
+        pass
+    # _dedup_boxes 와 동일하게 면적 내림차순으로 keep(기하 보존). 겹침(IoU>0.5) 시
+    # raster 우선순위로 라벨만 승격한다.
+    kept: list[tuple[list[float], str]] = []
+    for b, src in sorted(
+        tagged, key=lambda t: (t[0][2] - t[0][0]) * (t[0][3] - t[0][1]), reverse=True
+    ):
+        dup_i = next((i for i, k in enumerate(kept) if _iou(b, k[0]) > 0.5), None)
+        if dup_i is not None:
+            if kept[dup_i][1] != "raster_density" and src == "raster_density":
+                kept[dup_i] = (kept[dup_i][0], "raster_density")
+            continue
+        kept.append((b, src))
+    return kept
+
+
+def detect_oversized_tables(
+    page, exclude_xrefs: Optional[set[int]] = None
+) -> list[list[float]]:
+    """오버사이즈 표 라우팅 단일 SSoT: raster 행렬표(detect_oversized_matrix_tables) +
+    테두리 없는 벡터 dense 표(detect_dense_vector_tables) 를 합쳐 반환(IoU 중복 제거).
+
+    자동 파이프라인 3개 사용처(_scan_oversized_pages/extract_figures/_oversized_body_md)가
+    이 함수 하나를 호출해 '스킵 판정·크롭·표밖본문 제외'가 항상 동일 박스집합에 대해
+    일관되게 동작하도록 보장한다(사용처 분기 시 페이지 유실/중복 위험 차단). 박스별 검출
+    출처가 필요하면 _detect_oversized_tables_tagged 를 쓴다(동일 박스집합·기하)."""
+    return [
+        b
+        for b, _src in _detect_oversized_tables_tagged(page, exclude_xrefs=exclude_xrefs)
+    ]
+
+
 def _is_figure_describe_enabled() -> bool:
     """EXTRACT_FIGURE_DESCRIBE 가 truthy 면 크롭 figure 에 qwen3-vl 비전문가 설명 생성.
 
@@ -1805,12 +2039,13 @@ def extract_figures(
                             "description": desc,
                         })
 
-            # 7) 오버사이즈 행렬표(raster) → 이미지(opt-in, 6번과 완전히 독립적인 탐지
-            #    경로 — 벡터 격자가 아니라 삽입 이미지 px밀도/점유율 기반). 표 전체가
-            #    이미 이미지이므로 표 전체 영역(bbox)을 그대로 크롭한다(서브박스 축소 X).
+            # 7) 오버사이즈 표 → 이미지(opt-in, 6번과 독립적인 탐지 경로). raster 삽입
+            #    이미지 표(px밀도/점유율) + 테두리 없는 벡터 dense 표(열 정렬 밀도, Fix1
+            #    Phase2)를 detect_oversized_tables 단일 SSoT 로 합쳐 크롭한다(표 전체
+            #    영역 bbox 그대로, 서브박스 축소 X).
             if om_enabled:
                 try:
-                    om_boxes = detect_oversized_matrix_tables(
+                    om_boxes = _detect_oversized_tables_tagged(
                         page, exclude_xrefs=om_watermark_xrefs
                     )
                 except Exception as e:  # noqa: BLE001 — 검출 실패가 파이프라인 중단 X
@@ -1820,7 +2055,7 @@ def extract_figures(
                     t_anchors = table_caption_anchors(page)
                     ok = 0
                     dedup_against = page_fig_bboxes + page_table_bboxes
-                    for cl in om_boxes:
+                    for cl, cl_src in om_boxes:
                         # 이미 figure/사선표로 채택된 영역과 크게 겹치면 중복이므로 skip.
                         if any(_iou(cl, fb) > 0.5 for fb in dedup_against):
                             continue
@@ -1852,7 +2087,7 @@ def extract_figures(
                             "type": "complex_table",
                             "kind": _oversized_table_kind(),
                             "bbox": bbox_r,
-                            "source": "raster_density",
+                            "source": cl_src,
                             "snap_iou": None,
                             "description": desc,
                         })

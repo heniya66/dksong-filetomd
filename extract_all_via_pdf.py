@@ -1357,6 +1357,97 @@ def _find_gfm_blocks(lines) -> list:
     return blocks
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Fix3 (Phase2, 2026-07-12): 테두리 없는 2단 그룹헤더 표 → '{그룹명} {서브라벨}' 완전수식.
+#
+# 완전수식 그룹헤더 처리는 그동안 FMDW_GRID_TABLES(find_tables 격자) 경로 전용
+# (_render_grid_gfm)이라, 테두리가 없어 glm 이 markdown 으로 낸 2단 그룹헤더 표는
+# 미적용이었다. 여기서는 grid 경로와 '동일한 grouped 술어'를 markdown 표 블록에
+# 적용해 borderless 표도 단일 완전수식 헤더로 평탄화한다(fmdw 룰 2026-07-10).
+#
+# 안전(회귀 0): 발동 조건 = '헤더행(구분행 직전)에 그룹라벨 + 그 오른쪽 빈 셀 ≥2 개'
+# 且 '서브행(구분행 직후 첫 데이터행)의 선두 셀 공란' 且 '빈 셀 ≥2 개를 서브행이 채움'.
+# 정상 단일헤더 표는 헤더행에 빈 셀이 없어 발동하지 않는다(units 행 표 포함). 발동 시에도
+# grid 경로와 동일 병합 규칙이라 이미 승인된 로직과 동형. FMDW_BORDERLESS_GROUPHDR 로 토글.
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _borderless_group_headers_enabled() -> bool:
+    return os.getenv("FMDW_BORDERLESS_GROUPHDR", "1").strip().lower() not in (
+        "0", "false", "no", "off")
+
+
+def _parse_md_row(line: str) -> list:
+    """GFM 표 행 → 셀 문자열 리스트(양끝 파이프로 생긴 빈 토큰 제거)."""
+    parts = line.split("|")
+    if parts and parts[0].strip() == "":
+        parts = parts[1:]
+    if parts and parts[-1].strip() == "":
+        parts = parts[:-1]
+    return [c.strip() for c in parts]
+
+
+# Minor#2(Phase2) 실데이터 검증 결과: 현 코퍼스(output/pdf_md 87 + 백업 87, 전수 스캔)
+#   에서 이 평탄화가 발동하는 실샘플 0건 -> Fix3 는 방어적 조치이며 회귀는 단위테스트
+#   (test_phase2_fixes.py test_fix3_*)로만 커버한다. 유일한 loose 후보(HS_p0031-0060
+#   Table 5-4)는 캡션이 전 셀에 복제된 OCR 붕괴 표라 구조 술어가 (정당하게) 미발동.
+def _flatten_borderless_group_headers(md: str) -> str:
+    """테두리 없는 2단 그룹헤더 markdown 표를 완전수식 단일 헤더로 평탄화(Fix3, 멱등).
+
+    grid 경로(_render_grid_gfm) 의 grouped 술어를 markdown 에 이식: 헤더행(구분행 직전)의
+    그룹라벨을 오른쪽으로 forward-fill 하고, 그 아래 서브행(구분행 직후 첫 데이터행)의
+    라벨을 '{그룹명} {서브라벨}' 로 병합한 단일 헤더행으로 대체(서브행은 헤더로 흡수).
+    발동 가드가 엄격해 정상 단일헤더 표에는 무변경(회귀 0)."""
+    if not md or not _borderless_group_headers_enabled():
+        return md
+    lines = md.split("\n")
+    blocks = _find_gfm_blocks(lines)
+    if not blocks:
+        return md
+    out = lines[:]
+    changed = 0
+    for (bs, be) in reversed(blocks):  # 뒤에서부터 → 인덱스 유지
+        block = out[bs:be + 1]
+        sep_i = next((k for k, l in enumerate(block) if _GFM_SEP_RE.match(l)), None)
+        if sep_i is None or sep_i == 0 or sep_i + 1 >= len(block):
+            continue  # 헤더행 + 구분행 + 최소 1 데이터행 필요
+        grp = _parse_md_row(block[sep_i - 1])   # 그룹행(헤더)
+        sub = _parse_md_row(block[sep_i + 1])   # 서브행(첫 데이터행)
+        ncol = max(len(grp), len(sub))
+        grp += [""] * (ncol - len(grp))
+        sub += [""] * (ncol - len(sub))
+        if sub[0].strip():
+            continue  # 서브행 선두 셀이 차 있으면 그룹헤더 아님(정상 데이터행)
+        spanned = [j for j in range(ncol) if (not grp[j].strip()) and sub[j].strip()]
+        if len(spanned) < 2:
+            continue  # 그룹 스팬(빈 헤더칸을 서브가 채움)이 2 미만이면 미발동
+        if not any(grp[j].strip() for j in range(spanned[0])):
+            continue  # 스팬 왼쪽에 그룹라벨이 있어야 진짜 2단 그룹헤더
+        header = []
+        group_name = ""
+        for j in range(ncol):
+            h0, h1 = grp[j].strip(), sub[j].strip()
+            if h0:
+                group_name = h0
+            if h1:
+                header.append((group_name + " " + h1).strip() if group_name else h1)
+            else:
+                header.append(h0)
+        nc = len(header)
+        new_block = ["| " + " | ".join(header) + " |",
+                     "| " + " | ".join([":---"] * nc) + " |"]
+        for row_line in block[sep_i + 2:]:
+            cells = _parse_md_row(row_line)
+            cells += [""] * (nc - len(cells))
+            new_block.append("| " + " | ".join(cells[:nc]) + " |")
+        out[bs:be + 1] = new_block
+        changed += 1
+    if changed:
+        print(f"    [MD-FILTER] 테두리없는 2단 그룹헤더 표 {changed}개 완전수식 평탄화(Fix3)",
+              flush=True)
+        return "\n".join(out)
+    return md
+
+
 def _grid_page_info(pdf_path, page: int):
     """(grids[(grid,bbox)], page_height, non_table_line_count). 실패 시 ([],0.0,0).
 
@@ -1623,12 +1714,21 @@ def _is_gfm_separator(line: str) -> bool:
     return bool(cells) and all(re.fullmatch(r":?-{2,}:?", c) for c in cells)
 
 
+# Fix2 (Phase2, 2026-07-12): 광폭 표 절단(finish_reason=length) 시 glm 이 셀/구분행을
+#   '... ...'(또는 '… …') 생략부호로 메우는 절단 서명. 연속 2회 이상은 정상 데이터가
+#   아니라 절단 아티팩트다(HS_p0249 광폭 delta표 실측). '|'-표 라인에서만 판정해 산문의
+#   정당한 단일 말줄임표는 보존(오탐 0).
+_ELLIPSIS_RUNAWAY_RE = re.compile(r"(?:\.\.\.\s*){2,}|(?:…\s*){2,}")
+
+
 def _is_runaway_line(line: str) -> bool:
     """퇴행 폭주 라인 판정: (1) `|`/`,` 구분 셀 연속 반복(모든 짧은 토큰), (2) 긴 라인의
-    셀 내부 공백구분 연속 반복(코드형 토큰만). GFM 구분행·정상 표행(빈 셀이 연속을 끊음,
-    알려진 표 최대 연속 ~7)·산문은 트리거되지 않는다."""
+    셀 내부 공백구분 연속 반복(코드형 토큰만), (3) 표 라인 내 말줄임표 절단(Fix2). GFM
+    구분행·정상 표행(빈 셀이 연속을 끊음, 알려진 표 최대 연속 ~7)·산문은 트리거되지 않는다."""
     if _is_gfm_separator(line):
         return False
+    if "|" in line and _ELLIPSIS_RUNAWAY_RE.search(line):
+        return True
     if _consec_short_repeat(re.split(r"[|,]", line)):
         return True
     if len(line) > 200 and _consec_short_repeat(re.split(r"\s+", line), code_like=True):
@@ -1913,7 +2013,7 @@ def _scan_oversized_pages(pdf_path) -> set:
             for pidx in range(doc.page_count):
                 page = doc[pidx]
                 try:
-                    boxes = _fx.detect_oversized_matrix_tables(
+                    boxes = _fx.detect_oversized_tables(
                         page, exclude_xrefs=watermark_xrefs)
                 except Exception:  # noqa: BLE001 — 판정 실패는 해당 페이지 정상 OCR로 degrade
                     boxes = []
@@ -2078,7 +2178,7 @@ def _oversized_body_md(pdf_path, page: int) -> str:
             pg = doc[page - 1]
             try:
                 wx = _fx._watermark_xrefs(doc)
-                boxes = _fx.detect_oversized_matrix_tables(pg, exclude_xrefs=wx) or []
+                boxes = _fx.detect_oversized_tables(pg, exclude_xrefs=wx) or []
             except Exception:  # noqa: BLE001 — 박스 재검출 실패는 전체 라인을 표 밖으로 간주
                 boxes = []
             lines = _twocol_page_lines(pg)  # F1/F2 정제(러닝헤더·워터마크 제거) + 읽기순
@@ -4016,6 +4116,11 @@ _PROMPT_LEAK_LINE_SIGNATURES = (
     "never output the same content twice. transcribe",
     "no blank shortcuts: every",
     "transcribe all visible text, tables, and figures",
+    # Fix4 (Phase2, 2026-07-12): glm 이 프롬프트 말미 지시문("Output ONLY the Markdown
+    #   content (no surrounding code fence).")을 본문에 그대로 토하는 유출(DM_p1274 등 4건).
+    #   소문자 부분포함 매칭 — 정상 본문엔 없는 지시문 고유 문구라 오제거 위험 0.
+    "output only the markdown content",
+    "no surrounding code fence",
 )
 
 
@@ -5515,6 +5620,8 @@ def process_file(input_path, output_dir_base):
         # FIX A(2026-07-09): LLM 이 fallback/retry 경로에서 본문에 복창한 전사 계약
         #   (TRANSCRIPTION RULES ...) 누출 블록 제거. MD_STYLE 전, 결정론적 신뢰성 계층.
         combined = _strip_prompt_leak(combined)
+        # Fix3(Phase2 2026-07-12): 테두리 없는 2단 그룹헤더 표 → 완전수식 단일 헤더 평탄화.
+        combined = _flatten_borderless_group_headers(combined)
         # 결함1: 페이지 걸침으로 쪼개진 표 셀 설명 병합(소문자 연속 문단 → 앞 표 셀).
         combined = _merge_straddle_continuation(combined)
         # 결함2: 도면 내부 라벨의 본문 평문 유출 제거(인접 Figure 캡션과 substring 중복).

@@ -103,14 +103,18 @@ def detect_oversized_table_bbox(
       1. **벡터 사선표 검출**(``fx.detect_complex_tables``) → 후보가 있으면 최대 면적 채택.
       2. **래스터 오버사이즈 행렬표 검출**(``fx.detect_oversized_matrix_tables``) →
          후보가 있으면 최대 면적 채택(격자선 없는 순수 이미지 표 커버).
-      3. **폴백(본문영역 휴리스틱)**: 상단 ``top_margin_ratio``(헤더)·하단
+      3. **테두리 없는 벡터 dense 표 검출**(``fx.detect_dense_vector_tables``, Fix1
+         Phase2) → find_tables/complex/matrix 가 못 잡는 초광폭 벡터 수치 매트릭스
+         (DM biasing 매트릭스 등)를 열 정렬 밀도 휴리스틱으로 채택.
+      4. **폴백(본문영역 휴리스틱)**: 상단 ``top_margin_ratio``(헤더)·하단
          ``bottom_margin_ratio``(푸터)를 제외한 영역을 표로 간주한다(초대형 표는 통상
          페이지 대부분을 차지 — CLI 사용자가 페이지를 명시하므로 안전한 근사).
 
     Returns:
         [x0, y0, x1, y1] (PDF pt, 좌상단 원점). 항상 값을 반환한다(페이지당 표 1개 가정).
     """
-    for detector in (fx.detect_complex_tables, fx.detect_oversized_matrix_tables):
+    for detector in (fx.detect_complex_tables, fx.detect_oversized_matrix_tables,
+                     fx.detect_dense_vector_tables):
         try:
             boxes = detector(page) or []
         except Exception as exc:  # noqa: BLE001 — 검출 실패는 다음 폴백으로.
