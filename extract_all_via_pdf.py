@@ -5067,6 +5067,222 @@ def _merge_straddle_continuation(md: str) -> str:
     return "\n\n".join(b for b in blocks if b is not None)
 
 
+# ── 페이지/청크 걸침 표·도면 캡션 반복(FMDW_CAPTION_CONTINUATION, 기본 ON) — 2026-07-12 ──
+# RAG(Retrieval-Augmented Generation) 파편의 '소속' 명시: 캡션 있는 표/도면이 다음 페이지로
+# (캡션 없이) 이어지면, 이어지는 조각 상단에
+#   표   → '**Table N: <제목> (continued)**' + 원본 헤더 행 반복(열 이름 반복)
+#   도면 → '**Figure N: <제목> (continued)**'
+# 을 결정적으로 삽입한다. 이러면 청크가 조각 하나만 담아도 각 열 의미/도면 소속을 알 수 있고,
+# codesign-rag figure_linker 의 'Table N/Figure N' 언급→figure_id 매칭과 시너지가 난다.
+#
+# 보수적 검출(오탐 0 우선): '진짜 이어지는 표/도면'만 —
+#   (1) 이전 페이지 객체가 페이지 하단까지 닿음(잘림 신호=해당 페이지의 마지막 콘텐츠),
+#   (2) 다음 페이지 상단에 '캡션 없는' 동일 열구조(열수 동일) 객체가 시작(첫 콘텐츠),
+#   (3) 페이지 연속(N, N+1) — 청크(`---`) 경계도 절대 페이지 마커로 이어짐,
+#   (4) 이전 표에 반복할 캡션('Table N: 제목')이 존재.
+# 하나라도 애매하면 미삽입(별개 표에 엉뚱한 제목 붙이는 것이 최악). `(continued)` 표기로
+# 중복 캡션/2개 표 오인을 방지하고 멱등(재실행 시 이미 캡션 있으면 첫-콘텐츠 아님→무동작).
+_CONTCAP_TBL_RE = re.compile(r"^\s*\*{0,2}\s*table\s+(\d+)\s*[:.]\s*(.*)$", re.IGNORECASE)
+_CONTCAP_FIG_RE = re.compile(r"^\s*\*{0,2}\s*figure\s+(\d+)\s*[:.]\s*(.*)$", re.IGNORECASE)
+_CONTCAP_IMG_RE = re.compile(r"^\s*!\[")
+_CONTCAP_SEP_RE = re.compile(r"^\|[\s:|-]+\|$")
+
+
+def _caption_continuation_enabled() -> bool:
+    return os.getenv("FMDW_CAPTION_CONTINUATION", "1").strip().lower() not in (
+        "0", "false", "no")
+
+
+def _cc_is_skip(s: str) -> bool:
+    """경계 판정에서 건너뛰는 라인: 빈 줄·수평선·HTML 주석(페이지 마커는 세그먼트 분해가 처리)."""
+    if not s:
+        return True
+    if re.fullmatch(r"-{3,}|\*{3,}|_{3,}", s):
+        return True
+    return s.startswith("<!--") and s.endswith("-->")
+
+
+def _cc_cells(line: str) -> list:
+    return [c.strip() for c in line.strip().strip("|").split("|")]
+
+
+def _cc_norm_cells(cells) -> str:
+    return "|".join(re.sub(r"\s+", " ", c.strip().strip("*")).lower() for c in cells)
+
+
+def _cc_strip_continued(title: str) -> str:
+    return re.sub(r"\s*\(continued\)\s*$", "", title, flags=re.IGNORECASE).strip()
+
+
+def _cc_segment(md: str):
+    """md → [[marker_line|None, page_no|None, [body lines]], ...] (round-trip 보존)."""
+    segments = []
+    cur_marker, cur_pg, cur = None, None, []
+    for l in md.split("\n"):
+        m = _INJECT_PAGE_MARKER_RE.match(l)
+        if m:
+            segments.append([cur_marker, cur_pg, cur])
+            cur_marker, cur_pg, cur = l, int(m.group(1)), []
+        else:
+            cur.append(l)
+    segments.append([cur_marker, cur_pg, cur])
+    return segments
+
+
+def _cc_last_table_bottom(body: list):
+    """세그먼트 body 의 '마지막 콘텐츠'가 GFM 표면 (start,end) 반환, 아니면 None."""
+    blocks = _find_gfm_blocks(body)
+    if not blocks:
+        return None
+    s, e = blocks[-1]
+    for k in range(e + 1, len(body)):
+        if not _cc_is_skip(body[k].strip()):
+            return None
+    return (s, e)
+
+
+def _cc_first_table_top(body: list):
+    """세그먼트 body 의 '첫 콘텐츠'가 (캡션 없는) GFM 표면 (start,end) 반환, 아니면 None."""
+    blocks = _find_gfm_blocks(body)
+    if not blocks:
+        return None
+    s, e = blocks[0]
+    for k in range(0, s):
+        if not _cc_is_skip(body[k].strip()):
+            return None
+    return (s, e)
+
+
+def _cc_caption_above(body: list, start: int, rx):
+    """표/도면 시작 바로 위 최근접 비-skip 라인이 캡션이면 (num, title). 아니면 None."""
+    k = start - 1
+    while k >= 0 and _cc_is_skip(body[k].strip()):
+        k -= 1
+    if k < 0:
+        return None
+    m = rx.match(body[k])
+    if not m:
+        return None
+    title = _cc_strip_continued(m.group(2).strip().rstrip("*").strip())
+    return (m.group(1), title)
+
+
+def _cc_last_figure_bottom(body: list):
+    """마지막 콘텐츠가 도면(이미지, 또는 이미지 없는 Figure 캡션)이면 (num, title)."""
+    k = len(body) - 1
+    while k >= 0 and _cc_is_skip(body[k].strip()):
+        k -= 1
+    if k < 0:
+        return None
+    line = body[k]
+    if _CONTCAP_IMG_RE.match(line):                 # 마지막이 이미지 → 위쪽에서 Figure 캡션 탐색
+        j = k - 1
+        while j >= 0:
+            st = body[j].strip()
+            fm = _CONTCAP_FIG_RE.match(body[j])
+            if fm:
+                return (fm.group(1), _cc_strip_continued(fm.group(2).strip().rstrip("*").strip()))
+            if st and not _cc_is_skip(st) and not _CONTCAP_IMG_RE.match(body[j]):
+                return None                          # 이미지↔캡션 사이 다른 본문 → 도면 아님
+            j -= 1
+        return None
+    fm = _CONTCAP_FIG_RE.match(line)                # 마지막이 Figure 캡션(이미지 없음)
+    if fm:
+        return (fm.group(1), _cc_strip_continued(fm.group(2).strip().rstrip("*").strip()))
+    return None
+
+
+def _cc_first_image_top(body: list):
+    """첫 콘텐츠가 '캡션 없는' bare 이미지면 그 라인 index, 아니면 None."""
+    k = 0
+    while k < len(body) and _cc_is_skip(body[k].strip()):
+        k += 1
+    if k >= len(body):
+        return None
+    return k if _CONTCAP_IMG_RE.match(body[k]) else None
+
+
+def _apply_caption_continuation(md: str) -> str:
+    """페이지/청크 걸침 표·도면에 '(continued)' 캡션(+표 헤더 반복)을 삽입. gate OFF 시 무변경."""
+    if not md or not _caption_continuation_enabled():
+        return md
+    segments = _cc_segment(md)
+    changed = False
+
+    # ── 표 이어짐 ──
+    for i in range(len(segments) - 1):
+        pg_a, body_a = segments[i][1], segments[i][2]
+        pg_b, body_b = segments[i + 1][1], segments[i + 1][2]
+        if pg_a is None or pg_b is None or pg_b != pg_a + 1:
+            continue
+        la = _cc_last_table_bottom(body_a)
+        if not la:
+            continue
+        cap = _cc_caption_above(body_a, la[0], _CONTCAP_TBL_RE)
+        if not cap:
+            continue                    # 반복할 캡션 제목이 없음 → 미삽입
+        fb = _cc_first_table_top(body_b)
+        if not fb:
+            continue
+        num, title = cap
+        head_a = _cc_cells(body_a[la[0]])
+        sb, eb = fb
+        head_b = _cc_cells(body_b[sb])
+        if len(head_a) < 2 or len(head_a) != len(head_b):
+            continue                    # 열수 불일치 → 별개 표(미삽입)
+        cont_cap = (f"**Table {num}: {title} (continued)**" if title
+                    else f"**Table {num} (continued)**")
+        if _cc_norm_cells(head_a) == _cc_norm_cells(head_b):
+            # 헤더 이미 반복됨 → 캡션만 표 위에 삽입.
+            new_body = list(body_b)
+            new_body[sb:sb] = [cont_cap, ""]
+        else:
+            # 다음 표 첫 행이 원 헤더와 다름 = GFM 강제 헤더(실은 데이터 행 가능) → 원 헤더+
+            #   구분선 prepend + 기존 첫 행을 데이터로 강등(무손실).
+            ncol = len(head_a)
+            rebuilt = [cont_cap, "", body_a[la[0]],
+                       "| " + " | ".join([":---"] * ncol) + " |"]
+            has_sep = (sb + 1 <= eb) and bool(_CONTCAP_SEP_RE.match(body_b[sb + 1].strip()))
+            data_start = sb + 2 if has_sep else sb
+            if has_sep:
+                rebuilt.append(body_b[sb])           # 가짜 헤더 → 데이터 행
+            rebuilt.extend(body_b[data_start:eb + 1])
+            new_body = body_b[:sb] + rebuilt + body_b[eb + 1:]
+        segments[i + 1][2] = new_body
+        changed = True
+
+    # ── 도면 이어짐(보수적: 이전 페이지 말미가 도면 N + 다음 페이지 첫 콘텐츠가 캡션없는 이미지) ──
+    for i in range(len(segments) - 1):
+        pg_a, body_a = segments[i][1], segments[i][2]
+        pg_b, body_b = segments[i + 1][1], segments[i + 1][2]
+        if pg_a is None or pg_b is None or pg_b != pg_a + 1:
+            continue
+        fig = _cc_last_figure_bottom(body_a)
+        if not fig:
+            continue
+        img_idx = _cc_first_image_top(body_b)
+        if img_idx is None:
+            continue
+        num, title = fig
+        cont_cap = (f"**Figure {num}: {title} (continued)**" if title
+                    else f"**Figure {num} (continued)**")
+        new_body = list(body_b)
+        new_body[img_idx:img_idx] = [cont_cap, ""]
+        segments[i + 1][2] = new_body
+        changed = True
+
+    if not changed:
+        return md
+    out = []
+    for marker, _pg, body in segments:
+        if marker is not None:
+            out.append(marker)
+        out.extend(body)
+    print("    [MD-CONTCAP] 페이지/청크 걸침 표·도면 캡션 반복 삽입"
+          "(FMDW_CAPTION_CONTINUATION)", flush=True)
+    return "\n".join(out)
+
+
 _FIGLABEL_CAP_RE = re.compile(
     r"^\s*(?:#{1,6}\s*)?\**\s*(?:figure|table)\s+[\w.]+\s*[:.]\s*(.+)$", re.I)
 
@@ -5327,6 +5543,10 @@ def process_file(input_path, output_dir_base):
         # F9(2026-07-09): 리터럴 `•`/`–` 불릿 → Markdown 리스트 정규화(가로붙음 방지).
         #   FMDW_BULLET_LIST=0 비활성. 코드펜스/표행 무변경.
         combined = _normalize_bullets(combined)
+        # CONTCAP(2026-07-12): 페이지/청크 걸침 표·도면에 '(continued)' 캡션+헤더 반복 삽입
+        #   (RAG 파편 소속 명시). 최종 표/캡션 형태가 확정된 마지막 콘텐츠 후처리로 배치.
+        #   FMDW_CAPTION_CONTINUATION=0 비활성(회귀 0). 페이지 마커·표 행만 사용(결정론).
+        combined = _apply_caption_continuation(combined)
         has_failures = bool(failed_chunks)
 
         # H-5: 실패 청크가 있으면 .partial.md 로 저장 — 완성본으로 위장하지 않는다.

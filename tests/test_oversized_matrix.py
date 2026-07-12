@@ -170,7 +170,7 @@ def test_gate_off_extract_figures_zero_oversized_items(tmp_path, monkeypatch):
     monkeypatch.delenv("EXTRACT_OVERSIZED_MATRIX_TABLES", raising=False)
     monkeypatch.setenv("EXTRACT_FIGURE_DETECT", "deterministic")  # LLM 미호출(네트워크 0)
     figs = fx.extract_figures(_DESIGN_PDF, tmp_path, dpi=72)
-    om_items = [f for f in figs if f.get("kind") == "oversized_matrix"]
+    om_items = [f for f in figs if f.get("kind") in ("oversized_table", "oversized_matrix")]
     assert om_items == []
 
 
@@ -179,7 +179,7 @@ def test_gate_on_extract_figures_flags_11_12_13_as_complex_table(tmp_path, monke
     monkeypatch.setenv("EXTRACT_OVERSIZED_MATRIX_TABLES", "1")
     monkeypatch.setenv("EXTRACT_FIGURE_DETECT", "deterministic")  # LLM 미호출(네트워크 0)
     figs = fx.extract_figures(_DESIGN_PDF, tmp_path, dpi=72)
-    om_items = [f for f in figs if f.get("kind") == "oversized_matrix"]
+    om_items = [f for f in figs if f.get("kind") in ("oversized_table", "oversized_matrix")]
     om_pages = sorted({f["page"] for f in om_items})
     assert om_pages == [11, 12, 13]
     for item in om_items:

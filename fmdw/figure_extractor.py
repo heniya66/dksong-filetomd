@@ -294,6 +294,31 @@ def _oversized_cover_hi() -> float:
         return OVERSIZED_COVER_HI_DEFAULT
 
 
+def _oversized_figid_legacy() -> bool:
+    """FMDW_OVERSIZED_FIGID_LEGACY 가 truthy 면 구 figure_id/kind 형식(omtbl/oversized_matrix)
+    유지. 기본 OFF → codesign-rag figure_linker 계약(table_oversized/oversized_table) 사용.
+    신규 변환에만 영향(기존 배포 사이드카는 불변) — 회귀 롤백용 게이트.
+    """
+    return os.getenv("FMDW_OVERSIZED_FIGID_LEGACY", "").strip().lower() in _DIAG_TRUTHY
+
+
+def _oversized_table_figure_id(stem: str, page_no: int, k: int) -> str:
+    """오버사이즈 행렬표 크롭 figure_id. 기본 = codesign-rag 계약 형식
+    '<stem>__pNN_table_oversized<k>'(figure_linker._FIG_ID_SUFFIX_RE 매치). 레거시 게이트
+    시 구 형식 '<stem>__pNN_omtbl<k>'. 자동경로·수동 도구(oversized_table.py) 단일 SSoT.
+    """
+    if _oversized_figid_legacy():
+        return f"{stem}__p{page_no:02d}_omtbl{k}"
+    return f"{stem}__p{page_no:02d}_table_oversized{k}"
+
+
+def _oversized_table_kind() -> str:
+    """오버사이즈 행렬표 사이드카 kind. 기본 = codesign-rag figure_linker._TABLE_KINDS
+    소속값 'oversized_table'(청크 링크 성립). 레거시 게이트 시 구 값 'oversized_matrix'.
+    """
+    return "oversized_matrix" if _oversized_figid_legacy() else "oversized_table"
+
+
 def _accept_oversized(density: float, cover: float) -> bool:
     """거대 매트릭스 표 이미지 채택 판정(3분기 OR — 위 '극단 단일축 게이트' 주석 참조).
 
@@ -1800,7 +1825,7 @@ def extract_figures(
                         if any(_iou(cl, fb) > 0.5 for fb in dedup_against):
                             continue
                         ok += 1
-                        figure_id = f"{stem}__p{page_no:02d}_omtbl{ok}"
+                        figure_id = _oversized_table_figure_id(stem, page_no, ok)
                         rel_image_path = f"figures/{figure_id}.png"
                         # 표 전체가 이미지이므로 검출 bbox(=이미지 bbox) 에 여백만 추가.
                         padded = _pad(cl, DIAG_PAD_PT, pw, ph)
@@ -1825,7 +1850,7 @@ def extract_figures(
                             "caption": cap,
                             "figure_no": "",
                             "type": "complex_table",
-                            "kind": "oversized_matrix",
+                            "kind": _oversized_table_kind(),
                             "bbox": bbox_r,
                             "source": "raster_density",
                             "snap_iou": None,
