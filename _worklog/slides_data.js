@@ -358,6 +358,20 @@ const DECK = {
         }
       ],
       "kicker": "23 · 로컬vs원격 fmdw 비교"
+    },
+    {
+      "date": "2026-07-12",
+      "type": "rich",
+      "title": "조밀표 OCR generator 실측 — glm-ocr 유지 확정",
+      "html": "<div class='good'><b>📌 30초 요약</b><br>조밀표 폴백 모델을 정하려 OCR 모델을 실측했습니다. 처음 쓴 <b>verifier 방식(오류 찾기)은 OCR generator 모델에 미스매치</b >라 전부 실패(0%). <b>generator 방식(직접 전사)</b >으로 재실측하니 <b>glm-ocr·Qianfan-4B 둘 다 Table 23을 100% 정확 전사</b >(D6의 dash·N/A 미세값까지). 결론: <b>현행 glm-ocr 유지</b >(교체 실익 없음). 원래 표 데이터 전멸은 모델이 아니라 grid/splice 문제였고 이미 해소됨.</div><h4>두 방식의 차이 (방법론 교훈)</h4><table><tr><th>방식</th><th>태스크</th><th>OCR 모델 적합성</th></tr><tr><td>verifier</td><td>MD 주고 오류 찾기(추론)</td><td>❌ 미스매치 — glm 재전사·Qianfan 400·Nanonets/olmOCR NO ERRORS(0%)</td></tr><tr><td><b>generator</b ></td><td>이미지→직접 전사</td><td>✅ 모델 본래 목적 — 실제 전사 정확도 측정</td></tr></table><h4>Generator 채점 (Table 23, 정답 12행×7=84셀)</h4><table><tr><th>모델</th><th>행 검출</th><th>셀 정확도</th><th>D6 미세값(C,-,C,C,N/A,C,-)</th></tr><tr><td><b>glm-ocr (현행)</b ></td><td>12/12</td><td><b>84/84 (100%)</b ></td><td>✅ 정확</td></tr><tr><td>Qianfan-4B</td><td>12/12</td><td><b>84/84 (100%)</b ></td><td>✅ 정확</td></tr><tr><td>Nanonets-OCR2-3B</td><td>10/12</td><td>70/70</td><td>⚪ 일부 누락</td></tr><tr><td>olmOCR2-7B</td><td>7/12</td><td>49/49</td><td>⚪ 일부 누락</td></tr></table><h4>Qianfan 400 원인·해결</h4><p>Qianfan은 4K 타일링 특화라 전체 페이지 이미지가 43,279토큰으로 context(32768) 초과 → 400. <b>표 영역만 크롭</b >하니 정상 작동(그룹헤더 colspan·컬럼·값 정확 전사). generator는 표를 직접 전사시키므로 크롭이 자연스럽다.</p><h4>결론</h4><div class='good'><ul style='margin:0'><li><b>현행 glm-ocr이 조밀표를 이미 완벽 전사</b > → <b>OCR 모델 교체 실익 없음, glm 유지 확정</b >(미결 #1 해소)</li><li>Qianfan도 100%지만 glm 대비 우위 없음</li><li>원래 Table 23 데이터 전멸은 <b>모델 정확도가 아니라 grid 경로↔glm 비결정성 상호작용</b > 문제였고 splice로 해소됨</li></ul></div><div class='warn'><b>남은 확인:</b > 이건 Table 23 한 케이스. 더 어려운 표(회전헤더·초고밀도·2단헤더)와 <b>glm 일관성(비결정성) 반복 측정</b >으로 결론을 더 굳힐 예정. (2026-07-12, generator 실측.)</div>",
+      "links": [
+        {
+          "label": "OCR 조사 근거(240번)",
+          "kind": "link",
+          "note": "동일 worklog 240_ocr_llm_research"
+        }
+      ],
+      "kicker": "24 · generator OCR 실측"
     }
   ]
 };
