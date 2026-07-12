@@ -330,6 +330,20 @@ const DECK = {
         }
       ],
       "kicker": "21 · RAG 분할·청킹 평가"
+    },
+    {
+      "date": "2026-07-12",
+      "type": "rich",
+      "title": "세션 종합 현황 — 완료/진행 결과 표",
+      "html": "<div class='good'><b>📌 30초 요약</b><br>이번 세션에서 LN08LPU 변환·파이프라인 개선·OCR 조사·RAG 설계까지 <b>6개 작업을 완료</b >(전부 Advisor 검증 또는 웹조사 근거)했고, <b>4개 작업이 진행 중</b >(대용량 변환·실측·신규 구현·구현 비교)입니다. 완료분은 카드 200~260 + git 커밋으로 남겼습니다.</div><h4>✅ 완료된 결과</h4><table><tr><th>#</th><th>작업</th><th>핵심 결과</th><th>산출물</th></tr><tr><td>1</td><td>LN08LPU 10개 PDF 변환</td><td>100% 로컬 LLM, 최신 파이프라인 통일. 원본 비전 대조 통과</td><td>output MD 10개</td></tr><tr><td>2</td><td><b>파이프라인 개선 11건</b ></td><td>표 splice·footer·소제목·figure 순서/위치·orphan·완전성가드 등. <b>Advisor APPROVED, 회귀 0</b ></td><td>커밋 4980099</td></tr><tr><td>3</td><td>로컬 검수 파일럿</td><td><b>구현 보류</b > — 8B Recall 25%, 32B 실행불가, MLX 30B 퇴행. 헛구현 회피</td><td>카드 230</td></tr><tr><td>4</td><td>OCR LLM 교체 조사</td><td><b>Qianfan-OCR-4B 1순위</b >(조밀표 특화). dense&gt;MoE, 특화&gt;범용, 벤치≠실측</td><td>카드 240</td></tr><tr><td>5</td><td>특성별 라우팅 설계</td><td>문서 10특성 → 규칙/LLM/크롭 3분류. 특성-모델 매칭 가설 + 테스트 매트릭스</td><td>카드 250</td></tr><tr><td>6</td><td>RAG 분할·청킹 평가</td><td><b>codesign-rag 청킹 이미 우수</b >(헤딩계층·표원자·breadcrumb·parent-child). 유일 개선=fmdw 분할 스냅</td><td>카드 260</td></tr></table><h4>🔄 진행 중</h4><table><tr><th>#</th><th>작업</th><th>상태</th></tr><tr><td>7</td><td>대용량 변환 (Design_Manual+HSPICE, 77분할)</td><td>71/77 진행 중</td></tr><tr><td>8</td><td>변환완료 → MD 백업 → 조밀표 모델 실측(4종 채점)</td><td>변환 완료 대기(자동)</td></tr><tr><td>9</td><td>신규 구현: 섹션/표 경계 스냅 분할 + 페이지/파일 걸침 표·도면 <b>제목 반복(continued)</b ></td><td>코드 작성 중</td></tr><tr><td>10</td><td>로컬 filestomdwgem vs 원격 filetomd fmdw 비교</td><td>분석 중</td></tr></table><h4>git 커밋 이력 (원격 heniya66/dksong-filetomd)</h4><table><tr><th>커밋</th><th>내용</th></tr><tr><td>4980099</td><td>1차 구현 완료 (파이프라인 11건 개선)</td></tr><tr><td>a0d72ab</td><td>로컬 검수 파일럿 카드(230)</td></tr><tr><td>c2a633c</td><td>convert_md.sh 변환 래퍼</td></tr><tr><td>29d5708</td><td>OCR 조사 카드(240)</td></tr><tr><td>545fd29</td><td>특성 라우팅 설계 카드(250)</td></tr><tr><td>093ffe8</td><td>RAG 청킹 평가 카드(260)</td></tr></table><h4>worklog 카드 (원격 filetomd)</h4><p>200 파이프라인 설명 · 210 로컬검수 설계 · 220 세션완료보고 · 230 파일럿 · 240 OCR조사 · 250 특성라우팅 · 260 RAG청킹 · <b>270 종합현황(현재)</b ></p><div class='good'>진행 중 4건이 완료되는 대로 각각 결과를 보고하고, 실측·구현·비교가 끝나면 <b>특성별 라우팅 파이프라인을 실측 기반으로 확정</b >할 예정입니다. (2026-07-12 기준 스냅샷.)</div>",
+      "links": [
+        {
+          "label": "GitHub 저장소",
+          "kind": "link",
+          "note": "https://github.com/heniya66/dksong-filetomd"
+        }
+      ],
+      "kicker": "22 · 세션 종합 현황"
     }
   ]
 };
