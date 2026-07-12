@@ -321,5 +321,66 @@
   buildTL(); go(0);
 })();
 </script>
+
+<!-- worklog:side-toggle — 좌측 목차 접기/펴기 (2026-07-11) -->
+<script>
+(function(){
+  var KEY="worklog.sideHidden";
+  var header=document.querySelector("header.top")||document.querySelector("header");
+  var aside=document.querySelector(".wrap aside")||document.querySelector("aside");
+  if(!header||!aside) return;
+  if(document.getElementById("wlSideToggle")) return;
+
+  var st=document.createElement("style");
+  st.textContent=
+    "body.side-hidden .wrap>aside{display:none !important;}"+
+    "body.side-hidden .wrap>.resizer{display:none !important;}"+
+    "#wlSideToggle{font-family:inherit;cursor:pointer;font-size:13px;font-weight:600;"+
+    "line-height:1;color:var(--ink,#f1f5f9);background:var(--card,#1e293b);"+
+    "border:1px solid var(--line,#334155);border-radius:8px;padding:7px 12px;"+
+    "display:inline-flex;align-items:center;gap:6px;white-space:nowrap;"+
+    "transition:border-color .15s,background .15s;}"+
+    "#wlSideToggle:hover{border-color:var(--accent,#818cf8);background:#22304d;}"+
+    "@media print{#wlSideToggle{display:none;}}";
+  document.head.appendChild(st);
+
+  var btn=document.createElement("button");
+  btn.id="wlSideToggle"; btn.type="button";
+
+  function sync(){
+    var hidden=document.body.classList.contains("side-hidden");
+    btn.textContent=hidden?"\u2630 \ubaa9\ucc28 \ubcf4\uae30":"\u25c0 \ubaa9\ucc28 \uc228\uae30\uae30";
+    btn.title=(hidden?"\ubaa9\ucc28 \ud328\ub110 \ud3bc\uce58\uae30":"\ubaa9\ucc28 \ud328\ub110 \uc811\uae30")+" (\ub2e8\ucd95\ud0a4: T)";
+    btn.setAttribute("aria-pressed", hidden?"true":"false");
+  }
+  function apply(hidden,save){
+    document.body.classList.toggle("side-hidden",!!hidden);
+    if(save){ try{localStorage.setItem(KEY,hidden?"1":"0");}catch(e){} }
+    sync();
+  }
+
+  // 버튼 + 기존 제목을 좌측 그룹으로 묶어 헤더 레이아웃 유지(제목 왼쪽 / 갱신일 오른쪽)
+  var titleEl=header.querySelector(".t");
+  var group=document.createElement("div");
+  group.style.cssText="display:flex;align-items:center;gap:14px;min-width:0;";
+  header.insertBefore(group, header.firstChild);
+  group.appendChild(btn);
+  if(titleEl) group.appendChild(titleEl);
+
+  var saved="0"; try{saved=localStorage.getItem(KEY)||"0";}catch(e){}
+  apply(saved==="1", false);
+  btn.addEventListener("click", function(){ apply(!document.body.classList.contains("side-hidden"), true); });
+
+  document.addEventListener("keydown", function(e){
+    if((e.key==="t"||e.key==="T") && !e.metaKey && !e.ctrlKey && !e.altKey){
+      var el=document.activeElement, tag=el&&el.tagName;
+      if(tag==="INPUT"||tag==="TEXTAREA"||(el&&el.isContentEditable)) return;
+      apply(!document.body.classList.contains("side-hidden"), true);
+      e.preventDefault();
+    }
+  });
+})();
+</script>
+
 </body>
 </html>
