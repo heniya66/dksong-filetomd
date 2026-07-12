@@ -344,6 +344,20 @@ const DECK = {
         }
       ],
       "kicker": "22 · 세션 종합 현황"
+    },
+    {
+      "date": "2026-07-12",
+      "type": "rich",
+      "title": "로컬 filestomdwgem vs 원격 filetomd — fmdw 비교·상호적용 추천",
+      "html": "<div class='good'><b>📌 30초 요약</b><br>두 fmdw 저장소는 git 히스토리가 분리된 <b>독립 진화</b >로, 서로 다른 축을 최적화했습니다. <b>원격 filetomd = 출력 충실도·구조 후처리 압도적 우위</b >(extract_all 5432줄 vs 로컬 1404줄, 4배), <b>로컬 filestomdwgem = LLM 호출 견고성 + RAG 계약 도구</b > 축. 결론: 로컬 자산 3종을 원격으로 단방향 흡수 후 로컬 아카이브. 특히 <b>oversized_table.py 이식은 실제 RAG 검색 누락 버그를 해소</b >.</div><h4>⭐ 가장 중요한 발견 — oversized_table.py 이식 = RAG 검색 버그 해소</h4><div class='warn'>원격의 초대형표 크롭은 figure_id를 <code>__pNN_ctable1</code>로 생성 → <b>codesign-rag의 figure_id 매칭 정규식에 안 걸려 청크-도면 링크가 깨지고 검색에서 누락</b >됨. 로컬 <code>oversized_table.py</code>는 이 버그를 이미 진단·수정(<code>__pNN_table_oversized&lt;k&gt;</code> + <code>kind:oversized_table</code>로 RAG 계약 준수). <b>이식 시 실제 RAG 검색 누락 버그 해소</b > — RAG 품질 직결.</div><h4>모듈 인벤토리 (전용 모듈)</h4><table><tr><th>모듈</th><th>로컬</th><th>원격</th><th>기능</th><th>추천</th></tr><tr><td>oversized_table.py</td><td>O</td><td>X</td><td>초대형표 크롭+치환 재사용 도구, RAG 계약 준수</td><td><b>로컬→원격 이식(High)</b ></td></tr><tr><td>claude_guard.py</td><td>O</td><td>X</td><td>중첩 Claude 세션 데드락 가드</td><td>유지(원격은 claude_cli 제거로 불필요)</td></tr><tr><td>watermark_remover.py</td><td>X</td><td>O</td><td>PDF 추적 워터마크 무손실 제거</td><td>원격 유지</td></tr><tr><td>crop_dense_tables.py 등</td><td>X</td><td>O</td><td>1회용 하드코딩 크롭 스크립트</td><td>oversized_table로 대체</td></tr><tr><td>회귀 테스트 스위트</td><td>X</td><td>O</td><td>완전성·유출·잘림 테스트</td><td>원격 유지</td></tr></table><h4>기능 비교 (요약)</h4><table><tr><th>기능 영역</th><th>로컬</th><th>원격</th></tr><tr><td>표 splice·그리드 좌표추출·2단헤더 봉합</td><td>X</td><td><b>O</b ></td></tr><tr><td>footer/소제목/figure 정렬·orphan/완전성가드</td><td>X</td><td><b>O</b ></td></tr><tr><td>md_style·TOC 2열표·프롬프트 유출제거</td><td>X</td><td><b>O</b ></td></tr><tr><td>워터마크 PDF구조 제거·초대형표 자동검출</td><td>X</td><td><b>O</b ></td></tr><tr><td>MLX 30B describe+ko번역·앙상블·GPU직렬화</td><td>부분</td><td><b>O</b ></td></tr><tr><td><b>초대형표 수동보정 재사용 도구</b ></td><td><b>O</b ></td><td>X</td></tr><tr><td><b>로컬폴백 num_ctx 잘림 수정</b ></td><td><b>O</b ></td><td>X</td></tr><tr><td><b>커버리지 가드(자동 재추출)</b ></td><td><b>O</b ></td><td>유사X</td></tr></table><h4>로컬 → 원격 이식 추천 (우선순위)</h4><table><tr><th>순위</th><th>대상</th><th>효과</th></tr><tr><td><b>High</b ></td><td>oversized_table.py</td><td>RAG figure_id 계약 버그 해소 + 하드코딩 스크립트 대체</td></tr><tr><td><b>Medium</b ></td><td>폴백 num_ctx 잘림 수정(native /api/chat)</td><td>고밀도 이미지 조기 잘림 방지(원격 대체구현 확인 후)</td></tr><tr><td><b>Low-Med</b ></td><td>커버리지 가드</td><td>원격 완전성가드와 상보</td></tr></table><h4>종합 추천</h4><div class='good'><b>원격이 정식 SSoT</b >(출력 품질 전 영역 압도). 로컬의 claude_guard/claude_cli는 원격의 qwen-only 단순화로 불필요(원격 설계가 우수). <b>시너지 = 로컬 자산 3종(oversized_table + num_ctx수정 + 커버리지가드)을 원격으로 단방향 흡수 → 로컬 아카이브</b >. 역방향은 로컬 동결 정책상 불필요. (2026-07-12 코드 직접 비교. 불확실: 원격 git squash로 세부이력 미확인, 원격 num_ctx 대체구현 가능성 미검증.)</div>",
+      "links": [
+        {
+          "label": "GitHub 저장소(원격)",
+          "kind": "link",
+          "note": "https://github.com/heniya66/dksong-filetomd"
+        }
+      ],
+      "kicker": "23 · 로컬vs원격 fmdw 비교"
     }
   ]
 };
