@@ -292,6 +292,20 @@ const DECK = {
         }
       ],
       "kicker": "19 · OCR LLM 교체 조사"
+    },
+    {
+      "date": "2026-07-12",
+      "type": "rich",
+      "title": "문서 특성별 OCR 라우팅 파이프라인 설계 초안",
+      "html": "<div class='good'><b>📌 30초 요약</b><br>완벽 변환을 위해 LN08LPU 문서를 <b>10개 특성(C1~C10)</b >으로 분류하고, 각 특성을 <b>규칙코드/LLM/크롭</b > 3가지로 라우팅하는 파이프라인을 설계했습니다. 핵심은 ‘표’가 4종으로 분화되어 각각 최적 경로가 다르다는 것. 특성별 최적 모델 매칭은 <b>가설</b >이며(조밀표→Qianfan-4B 등), 벤치≠실측이라 <b>미결 10항목을 실측으로 확정</b >해야 완성됩니다.</div><h4>처리 3분류 (핵심 구분)</h4><svg viewBox='0 0 560 200' width='100%' style='max-width:560px;display:block;margin:12px auto'><rect x='0' y='0' width='560' height='200' fill='#16223e' stroke='#334155'/><text x='280' y='24' fill='#38bdf8' font-size='14' text-anchor='middle'>특성 → 3가지 처리 경로</text><rect x='16' y='40' width='172' height='140' rx='8' fill='#123047' stroke='#5b5fd1'/><text x='102' y='62' fill='#818cf8' font-size='12' text-anchor='middle'>규칙코드 (LLM無)</text><text x='102' y='86' fill='#f1f5f9' font-size='9' text-anchor='middle'>C6 목차</text><text x='102' y='102' fill='#f1f5f9' font-size='9' text-anchor='middle'>C9 워터마크·헤더</text><text x='102' y='118' fill='#f1f5f9' font-size='9' text-anchor='middle'>C5 2열 정의표</text><text x='102' y='134' fill='#f1f5f9' font-size='9' text-anchor='middle'>C2·C3 표 구조</text><text x='102' y='158' fill='#34d399' font-size='9' text-anchor='middle'>이미 결정론 완료</text><rect x='196' y='40' width='172' height='140' rx='8' fill='#0f2f26' stroke='#34d399'/><text x='282' y='62' fill='#34d399' font-size='12' text-anchor='middle'>LLM 필수</text><text x='282' y='86' fill='#f1f5f9' font-size='9' text-anchor='middle'>C1 본문 산문</text><text x='282' y='102' fill='#f1f5f9' font-size='9' text-anchor='middle'>C2·C3 표 셀값</text><text x='282' y='118' fill='#f1f5f9' font-size='9' text-anchor='middle'>C7 도면 검출</text><text x='282' y='134' fill='#f1f5f9' font-size='9' text-anchor='middle'>C8 수식</text><text x='282' y='158' fill='#94a3b8' font-size='9' text-anchor='middle'>특성별 모델 라우팅</text><rect x='376' y='40' width='168' height='140' rx='8' fill='#2a1720' stroke='#f87171'/><text x='460' y='62' fill='#f87171' font-size='12' text-anchor='middle'>OCR 오답→크롭</text><text x='460' y='90' fill='#f1f5f9' font-size='9' text-anchor='middle'>C4 초대형 진리표</text><text x='460' y='108' fill='#f1f5f9' font-size='9' text-anchor='middle'>C7 도면 본문</text><text x='460' y='138' fill='#94a3b8' font-size='9' text-anchor='middle'>전사 금지</text><text x='460' y='152' fill='#94a3b8' font-size='9' text-anchor='middle'>크롭 이미지 + (옵션)설명</text></svg><h4>특성-모델 매칭 가설</h4><table><tr><th>특성</th><th>처리</th><th>최적 가설</th></tr><tr><td>C1 본문 산문</td><td>LLM</td><td>glm-ocr 유지(고속·경량)</td></tr><tr><td>C2 조밀 값 표</td><td>규칙+LLM폴백</td><td>find_tables 좌표 + 폴백 glm→<b>Qianfan-4B</b >(4K 타일)</td></tr><tr><td>C3 2단 그룹헤더</td><td>규칙+LLM셀값</td><td>완전수식 후처리 + 셀값 Qianfan-4B</td></tr><tr><td>C4 초대형 진리표</td><td>크롭</td><td>크롭 + describe=MLX 30B(자유서술)</td></tr><tr><td>C7 도면</td><td>검출LLM+크롭</td><td>figure_detect + 크롭, 설명=MLX 30B</td></tr><tr><td>표 구조 검증</td><td>LLM검증기</td><td><b>Granite-Docling-258M</b >(초경량)</td></tr></table><h4>라우팅 구조</h4><p>기존 <code>_model_for_role</code> + 도메인 override 슬롯 위에 <b>‘블록 특성’ 축을 추가</b >. 페이지가 아닌 <b>블록 특성별 배치 처리</b >로 모델 스왑 최소화. <b>GPU 동시 상주 2슬롯 상한</b >(본문 모델 + describe 모델, 시분할 로드→언로드).</p><h4>실측으로 확정할 미결 (테스트 대상)</h4><div class='warn'>이 설계는 <b>가설</b >입니다. 다음을 실측 채점(정답 표에 오류 4종 주입 → 원본 대조)으로 확정: ①조밀표 폴백 모델(glm vs Qianfan vs Nanonets vs olmOCR2) ②2단헤더 셀값 정렬 ③PaddleOCR-VL/MonkeyOCR pull·평가 ④초대형표 describe 모델 ⑤수식 임계 ⑥표 검증 게이트 비용 등 <b>10개 항목</b >. GPU 직렬화(작은→큰 모델), 특성별 Recall/환각/일관성 지표.</div><div class='good'><b>다음 단계</b > — 대용량 변환 완료 후 실측 테스트 자동 착수 → 미결 10개 확정 → 최종 라우팅 파이프라인 구현. (2026-07-12 설계, 실측 전.)</div>",
+      "links": [
+        {
+          "label": "OCR 조사 근거(240번 카드)",
+          "kind": "link",
+          "note": "동일 worklog 240_ocr_llm_research"
+        }
+      ],
+      "kicker": "20 · 특성별 라우팅 설계"
     }
   ]
 };
