@@ -372,6 +372,25 @@ const DECK = {
         }
       ],
       "kicker": "24 · generator OCR 실측"
+    },
+    {
+      "date": "2026-07-12",
+      "type": "rich",
+      "title": "특성별 OCR 라우팅 최종 확정 — glm-ocr 단일 유지",
+      "html": "<div class='good'><b>📌 30초 요약</b><br>fmdw OCR 모델 교체를 위해 광범위 조사(HuggingFace·ollama)와 다단계 generator 실측을 했습니다. 결론: <b>모든 특성(조밀표·2단헤더·초고밀도·수식·본문)에서 glm-ocr이 100%·최상급</b >, 후보(Qianfan·Nanonets·olmOCR)는 열세 또는 동률(우위 0). <b>OCR 모델 교체 완전 불필요, glm-ocr 단일 유지가 정답.</b > 원래 문제는 모델이 아니라 파이프라인(grid↔glm·splice)이었고 이번 세션에 해소됨.</div><h4>실측 전체 종합 (generator 방식, temp=0)</h4><table><tr><th>특성</th><th>glm-ocr</th><th>대안 (최선)</th></tr><tr><td>조밀표 값 (T23)</td><td><b>100% ×5 일관</b >(바이트 동일)</td><td>Qianfan 75%(열 누락)</td></tr><tr><td>2단헤더 긴컬럼 (T2)</td><td><b>100%</b ></td><td>Qianfan 0%(환각 붕괴)</td></tr><tr><td>초고밀도 27행 (T19p2)</td><td><b>코드토큰 11/11</b ></td><td>Qianfan context 초과(400)</td></tr><tr><td>수식·알고리즘 (C8)</td><td><b>100%</b >(18/18, 3회 일관)</td><td>olmOCR2 동률·Qianfan 붕괴</td></tr><tr><td>본문 산문 (C1)</td><td><b>recall 1.0</b >, 환각 0</td><td>olmOCR2 동률(이득 0)</td></tr><tr><td>속도·크기</td><td><b>2.6~23s / 2.2GB(1.1B)</b ></td><td>olmOCR2 2배 느림·4배 큼</td></tr></table><h4>방법론 교훈 (2단계)</h4><ol><li><b>verifier 방식(오류 찾기)은 OCR generator 모델에 미스매치</b > → 전부 0%(방법 문제). 이걸 모델 무능으로 오판했으면 헛구현.</li><li><b>generator 방식(직접 전사)</b >으로 재측정 → glm의 진짜 실력(100%) 드러남. <b>벤치≠실측, 태스크≠모델 정합성</b > 확인.</li></ol><h4>최종 결론</h4><div class='good'><b>모든 특성에서 glm-ocr 유지가 정답.</b > 원래 ‘OCR 성능 부족’ 가설은 <b>실측으로 기각</b > — glm-ocr은 이미 최상급이고, 진짜 병목은 <b>파이프라인(grid↔glm 상호작용·표 splice·figure 배치)</b >이었으며 이번 세션에 전부 해소됨. Qianfan-4B가 유리한 케이스는 단 하나도 없었고(가장 쉬운 표만 동률), 10~30배 느리며 조밀 크롭에서 32k context 한계로 아예 못 받음.</div><h4>특성별 라우팅 파이프라인 확정</h4><table><tr><th>특성</th><th>처리</th><th>LLM</th></tr><tr><td>본문·표값·수식 전사</td><td><b>glm-ocr 단일</b ></td><td>glm (교체 불필요)</td></tr><tr><td>표 구조(격자·2단헤더)</td><td>find_tables 좌표(결정론) + splice</td><td>폴백만 glm</td></tr><tr><td>도면 describe</td><td>크롭 + 자유서술</td><td>MLX 30B(별도, 미실측)</td></tr><tr><td>목차·footer·워터마크·순서</td><td>결정론 후처리</td><td>LLM 없음</td></tr></table><div class='warn'><b>핵심:</b > 복잡한 특성별 모델 교체가 아니라 <b>glm 단일 + 결정론 후처리(이번 세션 개선)</b >가 최적임이 실측 확정. 남은 선택 항목: describe 모델(MLX vs 32B), 표구조 검증 게이트(Granite-Docling) — 필요 시 별도. (2026-07-12, generator 실측 종합.)</div>",
+      "links": [
+        {
+          "label": "generator 실측(290번)",
+          "kind": "link",
+          "note": "동일 worklog 290_generator_ocr_measure"
+        },
+        {
+          "label": "OCR 조사(240번)",
+          "kind": "link",
+          "note": "동일 worklog 240_ocr_llm_research"
+        }
+      ],
+      "kicker": "25 · OCR 라우팅 최종 확정"
     }
   ]
 };
