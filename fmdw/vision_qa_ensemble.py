@@ -293,6 +293,8 @@ def _majority_vote(run_verdicts: list[str]) -> str:
       3) 2+ run이 동일 구체값              → 그 값(confirmed value)
       4) 2+ run이 confirmed               → confirmed
       5) 동률/불명                         → 보수적으로 [unverified]
+      6) R10 M8: 단일 run 에만 등장한 구체값(나머지 전부 ABSENT) → 정족수(2+) 미달
+         → [unverified] 강등(값은 라인에 남고 플래그 부착 — 무플래그 확정 금지)
 
     구체값 vs [unreadable] 동수 등 모호한 경우는 안전하게 [unverified]로 수렴
     (값 환각보다 '검증 불가' 표기가 보수적).
@@ -351,11 +353,18 @@ def _majority_vote(run_verdicts: list[str]) -> str:
     if top_n == 1 and (n_confirmed >= 1 or n_unverified >= 1 or n_unreadable >= 1):
         return V_UNVERIFIED
 
-    # 단일 run만 존재(present 길이 1):
+    # 단일 run만 존재(present 길이 1) — 나머지 run 은 전부 ABSENT:
     if len(present) == 1:
-        # 그 run의 판정을 그대로 신뢰(2-run 미만은 호출부가 애초에 degrade하지만,
-        # 방어적으로 단일 의견 반영).
-        return present[0]
+        # R10 M8(QA 2026-07-15): 구 동작은 단일 의견의 '구체값'을 그대로 확정 채택
+        # → 모듈 계약('2+ run 동의가 채택 조건')의 미문서 우회 + 환각 run 1개의
+        # 값이 무플래그로 병합 MD 에 유입(n=3 에서 [100nF, ABSENT, ABSENT] 사례).
+        # 정족수(2+) 미달 단일 구체값은 [unverified] 로 강등한다 — 값 자체는 라인에
+        # 남고 _apply_verdict_to_line 이 [unverified] 플래그만 부착(값 단정 약화,
+        # 회로도 전사 원칙 '정확성 > 완전성' 정합). 플래그 판정(unreadable/
+        # unverified/confirmed) 단일 의견은 이미 보수적 표기라 그대로 반영(기존 유지).
+        if present[0] in (V_UNREADABLE, V_UNVERIFIED, V_CONFIRMED):
+            return present[0]
+        return V_UNVERIFIED
 
     # (5) 동률/불명 → 보수적 unverified.
     return V_UNVERIFIED

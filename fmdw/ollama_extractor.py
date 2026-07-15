@@ -436,6 +436,13 @@ _warned_cloud_models: set[str] = set()
 #: 손상 HTTP 500 → 실측 동작(4.5s VISION_OK) qwen3-vl:8b-instruct-q8_0 로 교체(로컬 유지).
 _LOCAL_FALLBACK_MODEL = "qwen3-vl:8b-instruct-q8_0"
 
+#: F-LOWMODEL-FLAG(2026-07-13): 이번 프로세스에서 '성공 응답'에 실제 사용된 모델 기록.
+#: 판정 하드코딩 금지 계약 — extract_all_via_pdf 가 변환 종료 시 이 집합을 근거로
+#: 저신뢰(소형 로컬-only) 여부를 판정해 <stem>_qa.json 에 기록한다.
+#: 성공 시에만 add(실패/재시도/차단 경로 미기록). 프로세스 전역 누적이므로 파일 단위
+#: 집계는 호출부가 시작 시점 스냅샷과의 차집합으로 계산한다.
+MODELS_USED: set[str] = set()
+
 
 def _is_cloud_model(model: str) -> bool:
     """모델명이 외부 cloud 추론 경로로 간주되는지 판정 (하드 로컬 가드용).
@@ -789,6 +796,8 @@ def _ollama_vision(
         else:
             text = text.strip()
 
+        # F-LOWMODEL-FLAG(2026-07-13): 성공 호출에 실사용된 모델 기록(저신뢰 판정 근거).
+        MODELS_USED.add(resolved_model)
         return text
 
     # 루프 정상 종료는 불가능(마지막 attempt에서 반드시 return/raise) — 방어 코드

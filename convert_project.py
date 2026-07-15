@@ -43,6 +43,9 @@ except ImportError:
 # ── 상수 ──────────────────────────────────────────────────────────────────────
 FMDW_MAIN = Path(__file__).parent / "extract_all_via_pdf.py"
 
+# R10 M7: 동시 실행 락 파일핸들 — 프로세스 생존 동안 유지(GC 조기 해제 방지).
+_LOCK_FH = None
+
 # 변환 대상 확장자 (이미 MD/텍스트인 파일은 native_md 처리)
 # .hwpx: hwp_pipeline.py 및 extract_all_via_pdf.py process_file/.main()이 지원
 CONVERTIBLE_EXTS = {".pdf", ".docx", ".pptx", ".xlsx", ".hwp", ".hwpx"}
@@ -171,12 +174,30 @@ def load_sources(sources_yaml: Path) -> dict:
     return data
 
 
+def _atomic_write(path: Path, data: str) -> None:
+    """R9 F3(QA M4): 동일 디렉토리 tmp 기록 → os.replace 원자 치환.
+
+    수백 엔트리 fingerprint 이력을 담는 sources.yaml 을 dump 도중 kill/디스크풀로
+    반쯤 쓰인 채 남기지 않는다(다음 실행 load_sources 파싱 크래시·이력 유실 방지)."""
+    tmp = path.with_name(path.name + f".tmp.{os.getpid()}")
+    try:
+        tmp.write_text(data, encoding="utf-8")
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+
 def save_sources(sources_yaml: Path, data: dict, dry_run: bool) -> None:
     if dry_run:
         return
     sources_yaml.parent.mkdir(parents=True, exist_ok=True)
-    with open(sources_yaml, "w", encoding="utf-8") as f:
-        yaml.dump(data, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
+    payload = yaml.dump(data, allow_unicode=True, default_flow_style=False,
+                        sort_keys=False)
+    _atomic_write(sources_yaml, payload)  # R9 F3: 비원자 dump → 원자 치환
 
 
 def find_entry(entries: list, src_rel: str) -> dict | None:
@@ -214,9 +235,29 @@ def final_md_name(fpath: Path) -> str:
     """수집 후 processed_md 에 저장할 최종 MD 파일명.
 
     사람이 읽기 쉽도록 원본 stem 기반으로 복원한다.
-    도메인 폴더로 분리되므로 같은 stem이라도 경로 충돌 없음.
+    ⚠️ R9 F1(QA C2/C3): FOLDER_DOMAIN_MAP 은 서로 다른 원본 폴더를 같은 도메인으로
+    매핑하므로(schematic+pcb→schematic, mech+reference→reference, design+patent→
+    design_doc) 같은 stem 이 도메인 폴더 안에서 충돌할 수 있다 — collect_outputs 가
+    소유자 대조 후 '타 원본 충돌'일 때만 unique_final_md_name 으로 유니크화한다.
+    (같은 원본의 재변환 갱신은 기존 그대로 덮어쓰기.)
     """
     return fpath.stem + ".md"
+
+
+def unique_final_md_name(fpath: Path, base_path: Path) -> str:
+    """R9 F1: stem 충돌 시 최종 MD 파일명 — <stem>__<sha8(src_rel)>.md.
+
+    src_rel 기반 sha8 이라 결정적: 같은 원본의 재변환은 항상 같은 이름으로
+    수렴한다(자기 갱신 안정). 스테이징 sha8(staged_name)과 동일 해시 규칙."""
+    return f"{fpath.stem}__{_sha8(fpath.relative_to(base_path))}.md"
+
+
+def _md_owner(entries: list, md_rel: str) -> str | None:
+    """R9 F1: sources.yaml 에서 md_rel 산출물을 소유한 원본(src_rel)을 찾는다."""
+    for e in entries or []:
+        if e.get("md") == md_rel:
+            return e.get("src")
+    return None
 
 
 # ── 소스코드 래핑 수집 헬퍼 ───────────────────────────────────────────────────
@@ -590,15 +631,27 @@ def collect_outputs(
     work_dir: Path,
     base_path: Path,
     dry_run: bool,
+    entries: list | None = None,
+    claimed: dict | None = None,
+    collisions: list | None = None,
 ) -> dict[str, str | None]:
     """output/<type>_md/*.md → 04_RAG/processed_md/<domain>/ 이동.
 
     C-2: staging_map 의 staged_md_fname 으로 출력 파일을 찾고,
     수집 후 최종 이름은 원본 stem 기반(final_md_name)으로 복원한다.
 
+    R9 F1(QA C2/C3, stem 충돌 가드): 서로 다른 원본이 같은 도메인·같은 stem 으로
+    수렴하면(FOLDER_DOMAIN_MAP 다대일 매핑) 뒤에 수집되는 쪽이 조용히 덮어써 문서가
+    영구 유실됐다. 소유자 대조 = 이번 실행 claimed(dest_rel→src_rel) 우선, 다음
+    sources.yaml md 소유 엔트리(_md_owner) — 로 '같은 원본의 재변환 갱신'(정상
+    덮어쓰기, 기존 동작 유지)과 '타 원본 충돌'을 구분해, 충돌일 때만
+    unique_final_md_name 으로 유니크화한다. figures JSON 사이드카도 동일 stem 동반.
+    충돌 내역은 collisions 리스트에 기록(main 이 sources.yaml 메타로 저장).
+
     Returns: {src_rel: output_md_rel | None}
     """
     results: dict[str, str | None] = {}
+    claimed = claimed if claimed is not None else {}
 
     for fpath, domain, fmdw_type in to_convert:
         src_rel = fpath.relative_to(base_path).as_posix()
@@ -613,11 +666,53 @@ def collect_outputs(
         final_name = final_md_name(fpath)          # 원본 stem 복원 이름
         dest_domain_dir = base_path / "04_RAG" / "processed_md" / domain
 
+        # ── R9 F1: 목적지 소유자 대조 — 타 원본 유래 충돌이면 유니크화 ──
+        dest_rel_plan = f"04_RAG/processed_md/{domain}/{final_name}"
+        owner = claimed.get(dest_rel_plan) or _md_owner(entries or [], dest_rel_plan)
+        if owner is None:
+            # R9b(Advisor): 대소문자 무관 FS(macOS APFS 기본)에서 stem 이 대소문자만
+            # 다른 두 원본은 dest_rel_plan 키가 갈려 정확 일치 조회를 우회한다 —
+            # 이번 실행 claimed 를 casefold 로 재조회(배치 내 케이스 변형 검출).
+            cf = dest_rel_plan.casefold()
+            owner = next((v for k, v in claimed.items() if k.casefold() == cf), None)
+        collide_with = None
+        if owner is not None and owner != src_rel:
+            collide_with = owner
+        elif owner is None and (dest_domain_dir / final_name).exists():
+            # R9b(Advisor): 소유자 미상인데 목적지에 실존 파일 → '미상 소유자 충돌'로
+            # 안전측 유니크화. 커버 시나리오 = ①sources.yaml 소실 후 고아 파일 +
+            # 같은 stem 타 원본 변환 ②케이스 무관 FS 의 대소문자 변형(exists() 가
+            # FS 대소문자 의미론을 그대로 따르므로 별도 분기 불필요). 자기 재변환
+            # 갱신은 위 owner==src_rel 경로(yaml 정상 시)가 덮어쓰기로 처리하므로
+            # 여기 도달 = 소유자 미상 상황뿐이며, yaml 소실 후 자기 재실행의 최악은
+            # 중복 1건 생성(유실 0 안전측 — Advisor 허용).
+            try:
+                actual = next((f.name for f in dest_domain_dir.iterdir()
+                               if f.name.casefold() == final_name.casefold()),
+                              final_name)
+            except OSError:
+                actual = final_name
+            collide_with = f"(unknown: on-disk '{actual}')"
+        if collide_with is not None:
+            uniq = unique_final_md_name(fpath, base_path)
+            print(f"  [WARN] stem collision: '{final_name}'({domain}) 은 "
+                  f"'{collide_with}' 소유 → '{src_rel}' 는 '{uniq}' 로 저장")
+            if collisions is not None:
+                collisions.append({
+                    "src": src_rel,
+                    "collided_with": collide_with,
+                    "original_name": final_name,
+                    "renamed_to": uniq,
+                    "domain": domain,
+                })
+            final_name = uniq
+            dest_rel_plan = f"04_RAG/processed_md/{domain}/{final_name}"
+
         if dry_run:
             if expected_md.exists():
-                dest_rel = f"04_RAG/processed_md/{domain}/{final_name}"
-                print(f"  [dry-run] 수집: {s_md} → {dest_rel}")
-                results[src_rel] = dest_rel
+                print(f"  [dry-run] 수집: {s_md} → {dest_rel_plan}")
+                results[src_rel] = dest_rel_plan
+                claimed[dest_rel_plan] = src_rel   # R9 F1: 배치 내 후속 충돌 검출
             else:
                 print(f"  [dry-run] 출력 없음(예정): {expected_md}")
                 results[src_rel] = None
@@ -630,6 +725,7 @@ def collect_outputs(
             inject_source_frontmatter(dest, src_rel)
             dest_rel = dest.relative_to(base_path).as_posix()
             results[src_rel] = dest_rel
+            claimed[dest_rel] = src_rel            # R9 F1: 배치 내 후속 충돌 검출
             print(f"  [수집] {fpath.name} → {dest_rel}")
 
             # figures 사이드카 이동 (있으면)
@@ -643,9 +739,11 @@ def collect_outputs(
                         shutil.move(str(fig_file), str(figures_dest / fig_file.name))
 
             # figures JSON 사이드카 (스테이징 이름 stem 기준으로 생성됨)
+            # R9 F1: 목적지 사이드카 이름은 최종 MD stem 을 따른다(충돌 유니크화 동반).
             json_sidecar = work_dir / output_subdir / (Path(s_name).stem + "_figures.json")
             if json_sidecar.exists():
-                shutil.move(str(json_sidecar), str(dest_domain_dir / (fpath.stem + "_figures.json")))
+                shutil.move(str(json_sidecar),
+                            str(dest_domain_dir / (Path(final_name).stem + "_figures.json")))
         else:
             print(f"  [경고] 출력 MD 없음: {expected_md} (변환 실패 가능)")
             results[src_rel] = None
@@ -682,21 +780,37 @@ def update_sources(
                 return
         entries.append(entry_data)
 
+    # R10 M6(QA): 변환 완료 후 sha256 재계산 시점에 원본이 사라져 있으면(NAS 언마운트·
+    # 폴더 정리 등 — 스테이징 copy2 와 재계산 사이 시간 창 실재) FileNotFoundError 가
+    # main() 까지 전파돼 save_sources 미도달 → 이미 성공한 다른 파일들의 기록까지
+    # 함께 유실됐다. 파일별 가드로 해당 엔트리만 sha=None + missing_source 마킹하고
+    # 배치는 계속한다(기록 보존).
+    def _safe_sha(fpath: Path, src_rel: str):
+        try:
+            return sha256_file(fpath), False
+        except OSError as e:
+            print(f"  [WARN] 원본 소실 — sha256 재계산 불가: {src_rel} ({e}) → "
+                  "missing_source 마킹 후 계속")
+            return None, True
+
     # 변환된(또는 실패한) 파일
     for fpath, domain, fmdw_type in to_convert:
         src_rel = fpath.relative_to(base_path).as_posix()
         md_rel = collect_results.get(src_rel)
-        sha = sha256_file(fpath)
+        sha, missing_src = _safe_sha(fpath, src_rel)   # R10 M6
         # I-1: 출력 MD 없으면 "failed" (stale은 원본 변경 의미로 구분)
         status = "converted" if md_rel else "failed"
-        upsert(src_rel, {
+        entry = {
             "src": src_rel,
             "domain": domain,
             "md": md_rel,
             "sha256": sha,
             "status": status,
             "converted_at": now_str,
-        })
+        }
+        if missing_src:
+            entry["missing_source"] = True
+        upsert(src_rel, entry)
 
     # native_md 파일
     for fpath, domain in native_md_list:
@@ -715,9 +829,9 @@ def update_sources(
     for fpath, domain, language in (to_collect_code or []):
         src_rel = fpath.relative_to(base_path).as_posix()
         md_rel = code_results.get(src_rel)
-        sha = sha256_file(fpath)
+        sha, missing_src = _safe_sha(fpath, src_rel)   # R10 M6: 동일 가드
         status = "collected" if md_rel else "failed"
-        upsert(src_rel, {
+        entry = {
             "src": src_rel,
             "domain": domain,
             "md": md_rel,
@@ -725,7 +839,10 @@ def update_sources(
             "status": status,
             "language": language,
             "converted_at": now_str,
-        })
+        }
+        if missing_src:
+            entry["missing_source"] = True
+        upsert(src_rel, entry)
 
     # skip 파일 — 기존 엔트리 유지 (converted_at 갱신 안 함, upsert 생략)
 
@@ -796,6 +913,35 @@ def main() -> None:
 
     sources_yaml = base_path / "04_RAG" / "sources.yaml"
     work_dir = base_path / "04_RAG" / ".convert_work"
+
+    # ── R10 M7(QA): 프로젝트 단위 동시 실행 락 ────────────────────────────────
+    # work_dir 이 base_path 기준 고정 경로 + 무락이라, 두 인스턴스가 동시 기동하면
+    # (도메인별 nohup 병렬 호출·스케줄+수동 재실행) 한쪽의 rmtree 가 다른 쪽의
+    # 스테이징 복사/run_fmdw 쓰기와 충돌 → 파일 소실·오염 변환이 가능했다.
+    # flock(EX|NB) 락파일로 제2 인스턴스를 명확한 에러로 조기 종료시킨다(제1
+    # 인스턴스 무영향). 락은 프로세스 종료 시 OS 가 자동 해제(크래시 포함)라
+    # stale lock 문제 없음. dry-run 도 락 대상(실행 중 계획 출력이 반쯤 정리된
+    # work_dir 를 읽는 혼선 방지).
+    # 한계(R10b 명기): flock 은 '로컬 FS' 전제 — NFS 등 네트워크/원격 FS 의
+    # base_path 에서는 잠금 의미론이 보장되지 않을 수 있다(현 운영 = 로컬 APFS).
+    # 부수효과: R9b collect_outputs 의 잔여 TOCTOU(소유자 대조 시점과 shutil.move
+    # 사이 타 인스턴스 개입 창)도 이 락으로 자연 해소된다 — 프로젝트당 단일 실행
+    # 이 보장되므로 대조·이동 사이에 끼어들 두 번째 쓰기 주체가 없다.
+    import fcntl
+    lock_path = base_path / "04_RAG" / ".convert.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    global _LOCK_FH
+    _LOCK_FH = open(lock_path, "w")
+    try:
+        fcntl.flock(_LOCK_FH.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print(f"[!] 이미 다른 convert_project.py 인스턴스가 이 프로젝트를 처리 중"
+              f"입니다 (lock: {lock_path}).\n"
+              "    동시 실행은 스테이징(.convert_work)을 파괴하므로 중단합니다. "
+              "기존 실행 종료 후 재시도하세요.", file=sys.stderr)
+        sys.exit(3)
+    _LOCK_FH.write(f"{os.getpid()}\n")
+    _LOCK_FH.flush()
 
     # ── ① 스캔 ────────────────────────────────────────────────────────────────
     print("\n[①] 스캔 중...")
@@ -873,6 +1019,8 @@ def main() -> None:
         domain_groups.setdefault(item[1], []).append(item)
 
     collect_results: dict[str, str | None] = {}
+    collect_claimed: dict[str, str] = {}    # R9 F1: dest_rel → src_rel (이번 실행 전체)
+    collect_collisions: list[dict] = []     # R9 F1: 충돌 기록(sources.yaml 메타 저장용)
     n_groups = len(domain_groups)
     for gi, (group_domain, group_items) in enumerate(sorted(domain_groups.items()), start=1):
         print(f"\n[②③④] 도메인 '{group_domain}' 처리 ({gi}/{n_groups}, "
@@ -913,7 +1061,10 @@ def main() -> None:
         # ── ④ 수집 ──────────────────────────────────────────────────────────────
         print("  [④] 출력 수집 중...")
         group_results = collect_outputs(group_items, staging_map, work_dir,
-                                        base_path, dry_run)
+                                        base_path, dry_run,
+                                        entries=entries,
+                                        claimed=collect_claimed,
+                                        collisions=collect_collisions)
         collect_results.update(group_results)
 
     converted_ok = sum(1 for v in collect_results.values() if v is not None)
@@ -926,6 +1077,18 @@ def main() -> None:
                           collect_results, base_path,
                           to_collect_code=to_collect_code,
                           code_results=code_results)
+    # R9 F1: stem 충돌 기록을 sources.yaml 메타(top-level collisions)에 남긴다.
+    # 재실행 시 동일 충돌 중복 기록 방지((src, renamed_to) 기준 dedupe).
+    if collect_collisions:
+        prev = data.get("collisions") or []
+        seen = {(c.get("src"), c.get("renamed_to")) for c in prev}
+        now_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        for c in collect_collisions:
+            if (c["src"], c["renamed_to"]) in seen:
+                continue
+            c["at"] = now_str
+            prev.append(c)
+        data["collisions"] = prev
     save_sources(sources_yaml, data, dry_run)
 
     if not dry_run and work_dir.exists():

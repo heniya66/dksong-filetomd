@@ -50,3 +50,13 @@ _bad_*/
 _curated_*/
 logs/
 *.log
+
+# QA 라운드 백업·실험 잔여물 (2026-07-15)
+*.bak-*
+*.bak[0-9]*
+.docling-venv/
+.vscode/
+_r4_test/
+_c8c1_eval/
+_goose_phase1_convert.txt
+_metrics_tmp.py

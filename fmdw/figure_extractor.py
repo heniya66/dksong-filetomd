@@ -586,6 +586,93 @@ def _dedup_boxes(boxes: list[list[float]], iou_thresh: float = 0.5) -> list[list
     return kept
 
 
+# ── 목차(ToC) 과이미지화 방지 가드 (FMDW_TOC_GUARD, 기본 ON) ────────────────────
+#   증상: 다중 페이지 목차(Table of Contents/List of Tables·Figures)의 점선 leader
+#   (섹션제목 …… 페이지번호)가 detect_dense_vector_tables 에서 규칙적 x좌표 토큰으로
+#   잡혀 aligned_cols>=18 을 충족 -> 초대형표(oversized_table)로 오분류·크롭되어 목차
+#   텍스트가 통째로 유실된다(HS_p0061-0083 p12~p22, 목차 189줄 -> 13줄 파괴).
+#   근본: PDF 는 점선 leader 를 '개별 단일점(".") word 토큰'의 긴 연속으로 넣는다
+#   (get_text("words") 한 목차행이 수십 개의 "." 토큰 -> 세로 정렬열 폭증).
+#   대응: 페이지 레벨에서 leader 신호(연속 점)를 세어 '목차형 페이지'면 raster/vector
+#   후보를 모두 억제(빈 리스트) -> 해당 페이지는 정상 본문 텍스트 경로로 전사된다.
+#   고정밀 원칙: 판별 주신호 = 점선 leader 뿐(언어무관). 점선 leader 가 없는 실제 밀집
+#   수치표는 leader 줄=0 이라 절대 억제되지 않는다(정상표 회귀 0). 'List of Tables'
+#   같은 제목 텍스트는 보조로도 쓰지 않는다(언어의존 오탐 회피).
+def _is_toc_guard_enabled() -> bool:
+    """FMDW_TOC_GUARD(기본 ON). 끄면 목차 가드를 완전 비활성(롤백용, 기존 동작 100%)."""
+    return os.getenv("FMDW_TOC_GUARD", "1").strip().lower() not in (
+        "0", "false", "no", "off")
+
+
+def _toc_guard_params() -> tuple[int, int, float]:
+    """목차 가드 임계(줄당 최소 leader 점 개수 / 목차형 절대 leader 줄수 / leader 줄 비율).
+    기본 4 / 8 / 0.30. 필요 시 env 로 튜닝(정상 동작엔 조정 불필요)."""
+    def _i(name: str, d: int) -> int:
+        try:
+            return int(os.getenv(name, str(d)))
+        except ValueError:
+            return d
+
+    def _f(name: str, d: float) -> float:
+        try:
+            return float(os.getenv(name, str(d)))
+        except ValueError:
+            return d
+
+    return (
+        _i("FMDW_TOC_LEADER_MIN_DOTS", 4),
+        _i("FMDW_TOC_LEADER_MIN_LINES", 8),
+        _f("FMDW_TOC_LEADER_MIN_RATIO", 0.30),
+    )
+
+
+#: 점선 leader 토큰 = 순수 점/leader 문자만으로 구성(ASCII '.', 중점 '\u00b7', hyphenation
+#: point '\u2027', 수평 ellipsis '\u2026', midline ellipsis '\u22ef'). 목차행은 이 토큰이
+#: 한 줄에 다수(연속) 등장한다. 숫자·소수점("0.75" 등)은 점만으로 이뤄지지 않아 매칭되지
+#: 않으므로 실제 수치표의 셀 값을 leader 로 오탐하지 않는다(고정밀 핵심).
+_TOC_LEADER_TOKEN_RE = re.compile(r"^[.\u00b7\u2027\u2026\u22ef]+$")
+
+
+def _toc_leader_dots(tok: str) -> int:
+    """토큰이 순수 leader(점/…)면 '점 등가 개수'를 돌려준다(아니면 0). '…' 는 3점 등가."""
+    t = tok.strip()
+    if not t or not _TOC_LEADER_TOKEN_RE.match(t):
+        return 0
+    return sum(3 if ch == "\u2026" else 1 for ch in t)
+
+
+def _is_toc_like_page(page) -> bool:
+    """목차형 페이지 여부(점선 leader 밀도 기반, 언어무관·고정밀).
+
+    get_text("words") 를 (block,line) 으로 묶어 각 줄의 leader 점 등가 개수를 세고, 한 줄이
+    >= min_dots(기본 4) 점이면 'leader 줄'로 본다. leader 줄이 전체 비어있지 않은 줄의
+    >= min_ratio(기본 0.30) 이거나 절대 >= min_lines(기본 8) 줄이면 True. 주신호는 오직
+    점선 leader(제목 …… 페이지번호)이며 제목 문자열은 쓰지 않는다. 점선 leader 가 없는
+    실제 밀집 수치표는 leader 줄=0 이므로 절대 True 가 되지 않는다(정상표 회귀 0)."""
+    try:
+        words = page.get_text("words")  # (x0,y0,x1,y1, word, block, line, wordno)
+    except Exception:  # noqa: BLE001
+        return False
+    if not words:
+        return False
+    line_dots: dict[tuple[int, int], int] = {}
+    for w in words:
+        try:
+            key = (int(w[5]), int(w[6]))
+        except (IndexError, TypeError, ValueError):
+            continue
+        line_dots[key] = line_dots.get(key, 0) + _toc_leader_dots(w[4])
+    if not line_dots:
+        return False
+    min_dots, min_lines, min_ratio = _toc_guard_params()
+    leader_lines = sum(1 for d in line_dots.values() if d >= min_dots)
+    if leader_lines == 0:
+        return False
+    total_lines = len(line_dots)
+    ratio = leader_lines / total_lines if total_lines else 0.0
+    return leader_lines >= min_lines or ratio >= min_ratio
+
+
 def _detect_oversized_tables_tagged(
     page, exclude_xrefs: Optional[set[int]] = None
 ) -> list[tuple[list[float], str]]:
@@ -600,6 +687,13 @@ def _detect_oversized_tables_tagged(
     (IoU>0.5)을 두 경로가 함께 잡으면 raster_density 로 확정한다(벡터 검출은 보강 신호로
     흡수). 박스 '기하'는 _dedup_boxes 와 완전 동일(면적 큰 것 우선 유지)로 보존 ->
     크롭/bbox/figure_id/kind 불변, 바뀌는 것은 메타 source 라벨뿐."""
+    # 목차형 페이지 억제(FMDW_TOC_GUARD): 점선 leader 를 밀집표로 오채택해 크롭하지
+    # 않도록 raster/vector 후보를 모두 비운다 -> 정상 본문 텍스트 경로로 전사된다
+    # (HS 목차 189줄 유실 회귀 차단). 이 SSoT chokepoint 는 크롭 경로
+    # (extract_figures 가 직접 호출) 와 scan/body 경로(detect_oversized_tables 위임)를
+    # 함께 커버한다.
+    if _is_toc_guard_enabled() and _is_toc_like_page(page):
+        return []
     tagged: list[tuple[list[float], str]] = [
         (b, "raster_density")
         for b in (detect_oversized_matrix_tables(page, exclude_xrefs=exclude_xrefs) or [])
@@ -2129,6 +2223,33 @@ def extract_figures(
     sidecar.write_text(
         json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+
+    # R10 M5(QA 2026-07-15): 재변환 고아 crop PNG 정리 — 이 문서 stem 소유
+    # (`{stem}__p<숫자>...`)의 기존 PNG 중 '새 사이드카가 참조하지 않는' 것만
+    # 삭제한다. 예: 1차 실행 fig1~3 → 재변환이 fig1~2 만 검출하면 p05_fig3.png 가
+    # 사이드카 미참조 고아로 무한 누적되던 결함(M5).
+    # R10b(Advisor LOW): 소유 판정은 startswith(f"{stem}__p")가 아니라 정규식
+    # `^{stem}__p\d` — figure_id 포맷({stem}__p{NN}_...)은 __p 뒤가 항상 숫자이므로
+    # 'A.pdf' 와 형제 문서 'A__pipeline.pdf'(crop = A__pipeline__p01_...) 를
+    # 오삭제하지 않는다(타 문서 무접촉 보장, re.escape 로 특수문자 stem 안전).
+    # 사이드카 쓰기 '성공 후'에만 실행(위 write_text 예외 시 여기 미도달 →
+    # 실패 시 삭제 0, 안전측). 삭제 실패는 비차단(경고만) — 다음 실행이 재시도.
+    try:
+        referenced = {Path(it.get("image_path", "")).name for it in items}
+        own_re = re.compile(rf"^{re.escape(stem)}__p\d")
+        if figures_dir.exists():
+            for old in sorted(figures_dir.iterdir()):
+                if (old.suffix.lower() == ".png"
+                        and own_re.match(old.name)
+                        and old.name not in referenced):
+                    try:
+                        old.unlink()
+                        _log.info("고아 crop 정리(M5): %s", old.name)
+                    except OSError as e:
+                        _log.warning("고아 crop 삭제 실패(무시): %s (%s)",
+                                     old.name, e)
+    except Exception as e:  # noqa: BLE001 — 정리 실패가 figure 추출을 깨지 않게
+        _log.warning("고아 crop 정리 실패(무시): %s", e)
     return items
 
 

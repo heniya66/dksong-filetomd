@@ -975,6 +975,23 @@ def _recover_absent_blocks(clean_lines, body_md: str):
     total = 0
     for (a, b) in runs:
         run_lines = []
+        # ── R7 F-NOTE(2026-07-14): 직상단 '짧은 라벨 줄'(예 'Note:') 동반 회수 ──
+        # _line_covered 의 '<2 유의미토큰 = 커버 간주' 규칙 때문에 콜론 종결 라벨 줄은
+        # run 에 못 들어와, glm 이 Note 블록을 통째 누락하면 항목(1.~4.)만 회수되고
+        # 라벨이 소실됐다(DM_p0018-0047 p6 실측). 조건(보수, 전부 충족 시에만):
+        # ①run 바로 위 라인 ②'Label:' 형(영문자 시작·≤24자·콜론 종결) ③본문에 실재
+        # 하지 않음(normalized substring) ④미복구분. 라벨 단독 회수는 없음(아래 run
+        # 유의미토큰 가드가 함께 적용 — run 이 버려지면 라벨도 버려짐).
+        a0 = a
+        if a > 0:
+            lt = (clean_lines[a - 1][4] or "").strip()
+            nlt = _norm_present(lt)
+            if (re.fullmatch(r"[A-Za-z][\w\s]{0,22}:", lt)
+                    and len(nlt) >= 2 and nlt not in body_norm
+                    and nlt not in seen_norm):
+                run_lines.append(lt)
+                seen_norm.add(nlt)
+                a0 = a - 1
         for k in range(a, b):
             t = clean_lines[k][4]
             nt = _norm_present(t)
@@ -987,7 +1004,7 @@ def _recover_absent_blocks(clean_lines, body_md: str):
         if not any(len(_sig_tokens(t)) >= 3 for t in run_lines):
             continue  # 스트레이 단어 run 배제(과복구 노이즈 가드)
         recovered.append(run_lines)
-        run_spans.append((a, b))
+        run_spans.append((a0, b))
         total += len(run_lines)
     return recovered, run_spans, covered, total
 
@@ -1279,6 +1296,113 @@ def _table_well_formed(grid) -> bool:
     return True
 
 
+# ── F-SUBROW(R7, 2026-07-14): 세로 다단(sub-row) 파편 행 결정론 병합 ─────────────
+# (FMDW_SUBROW_MERGE, 기본 ON — "0"=기존 동작.)
+# 원본이 한 논리 행(예 Table 2 'TR')의 값 열만 세로 다단으로 쪼갠 경우 find_tables 는
+# 스팬(병합) 열이 빈 별도 행을 반환 → MD 에 anchor 빈 고아 행으로 남아 LLM 이 앞 행
+# 소속으로 인식하지 못한다(사용자 신고 R7, qwen 실측). 파편 행을 직전 논리 행의 해당
+# 열에 join(FMDW_SUBROW_JOIN, 기본 '<br>' — qwen A/B 실측 후 확정)으로 병합한다.
+# 오병합 방지(보수 조건):
+#   (a) 선두 2열(anchor+Description)이 모두 공란 + 뒤쪽 열에 값 존재(3열 이상 표만)
+#   (b) 병합 대상(직전 논리 행)의 anchor 열이 비어있지 않음 — 페이지 상단 이월
+#       파편(부모가 이전 페이지, p3 상단 실측)은 병합하지 않고 보존(걸침 구조 불변)
+#   (c) 데이터 행 영역만(_grid_header_rows 헤더/2단 그룹 서브헤더 행 제외)
+# ★도구 동기화: doc_audit(c 행지문)·cross_verify(행 1:1)도 이 함수를 grid 측에 적용해
+#   동일 규칙으로 대조한다(3곳 공유 SSoT — 별도 재구현 금지).
+def _subrow_merge_enabled() -> bool:
+    return os.getenv("FMDW_SUBROW_MERGE", "1").strip().lower() not in (
+        "0", "false", "no")
+
+
+def _subrow_join() -> str:
+    return os.getenv("FMDW_SUBROW_JOIN", "<br>")
+
+
+def _subrow_is_fragment(cells) -> bool:
+    """행이 sub-row 파편 형상인가: 선두 2열 공란 + 뒤쪽 열에 값 존재(3열 이상)."""
+    if len(cells) < 3:
+        return False
+    c = [(v or "").strip() for v in cells]
+    return (not c[0]) and (not c[1]) and any(c[2:])
+
+
+def _subrow_merge_rows(rows, cell_boxes=None):
+    """sub-row 파편을 직전 논리 행에 병합. 반환 (merged_rows, merged_boxes|None).
+
+    rows: 행×열 텍스트. cell_boxes: 행×열 bbox(cross_verify — 병합 셀은 union) 또는
+    None. OFF/비해당 = 입력 사본 그대로. 멱등(병합판 재적용 = 무변화)."""
+    rows2 = [list(r) for r in rows]
+    boxes2 = [list(b) for b in cell_boxes] if cell_boxes is not None else None
+    if not _subrow_merge_enabled() or len(rows2) < 3:
+        return rows2, boxes2
+    hdr = _grid_header_rows(rows2)
+    join = _subrow_join()
+    out_r = rows2[:hdr]
+    out_b = boxes2[:hdr] if boxes2 is not None else None
+    n_data = 0                      # 지금까지 방출된 논리 데이터 행 수
+    for i in range(hdr, len(rows2)):
+        r = rows2[i]
+        if (n_data > 0 and _subrow_is_fragment(r)
+                and ((out_r[-1][0] if out_r[-1] else "") or "").strip()):
+            tgt = out_r[-1]
+            tb = out_b[-1] if out_b is not None else None
+            for j, v in enumerate(r):
+                v = (v or "").strip()
+                if not v:
+                    continue
+                while len(tgt) <= j:
+                    tgt.append("")
+                base = (tgt[j] or "").strip()
+                tgt[j] = (base + join + v) if base else v
+                if tb is not None:
+                    while len(tb) <= j:
+                        tb.append(None)
+                    nb = (boxes2[i][j] if j < len(boxes2[i]) else None)
+                    ob = tb[j]
+                    if nb and ob:
+                        tb[j] = (min(ob[0], nb[0]), min(ob[1], nb[1]),
+                                 max(ob[2], nb[2]), max(ob[3], nb[3]))
+                    elif nb:
+                        tb[j] = nb
+            continue
+        out_r.append(r)
+        if out_b is not None:
+            out_b.append(boxes2[i])
+        n_data += 1
+    return out_r, out_b
+
+
+def _numeric_col_align_enabled() -> bool:
+    return os.getenv("FMDW_NUMERIC_COL_ALIGN", "1").strip().lower() not in (
+        "0", "false", "off", "no")
+
+
+# C1(2026-07-13): 수치 다수 열 우측정렬(---:). 부호/소수점/천단위콤마/%/과학표기 허용.
+_NUMERIC_CELL_RE = re.compile(r"^[+\-±~]?\$?\d[\d,]*\.?\d*(?:[eE][+\-]?\d+)?\s*%?$")
+
+
+def _is_numeric_cell(s: str) -> bool:
+    """셀이 수치형인가(C1 열정렬 판정용). 공란/텍스트=False."""
+    s = s.strip()
+    return bool(s) and bool(_NUMERIC_CELL_RE.match(s))
+
+
+def _grid_col_seps(data_rows, nc) -> list:
+    """열별 GFM 구분자: 비어있지 않은 본문 셀 중 수치형 비율 ≥0.6 인 열만 '---:'(우측정렬),
+    그 외 ':---'(좌측=기존동작). 텍스트·셀내용·열수 불변, 정렬마커만 변경. 회귀≈0.
+    FMDW_NUMERIC_COL_ALIGN=0/false/off 면 전열 ':---'(기존 복원)."""
+    if not _numeric_col_align_enabled():
+        return [":---"] * nc
+    seps = []
+    for j in range(nc):
+        vals = [r[j].strip() for r in data_rows if j < len(r) and r[j].strip()]
+        if vals and sum(_is_numeric_cell(v) for v in vals) / len(vals) >= 0.6:
+            seps.append("---:")
+        else:
+            seps.append(":---")
+    return seps
+
+
 def _render_grid_gfm(grid) -> list:
     """grid(행×열 텍스트)를 GFM 표 라인 목록으로.
 
@@ -1287,6 +1411,7 @@ def _render_grid_gfm(grid) -> list:
     그룹 밖 열은 원래 헤더 유지. 별도 **굵은** 서브라벨 행은 방출하지 않는다(추론 불필요).
     또 스퍼리어스 빈-헤더 열(find_tables 병합셀 아티팩트)은 '데이터 무손실'일 때만 제거
     (헤더 공란 且 데이터 전부 공란 또는 같은 행 다른 열에 중복 = 유니크 데이터 0)."""
+    grid, _ = _subrow_merge_rows(grid)  # F-SUBROW(R7): sub-row 파편 병합(기본 ON, 멱등)
     ncol = max(len(r) for r in grid)
 
     def _row(r):
@@ -1334,7 +1459,7 @@ def _render_grid_gfm(grid) -> list:
     data_rows = [[r[j] for j in keep] for r in data_rows]
     nc = len(keep)
     out = ["| " + " | ".join(header) + " |",
-           "| " + " | ".join([":---"] * nc) + " |"]
+           "| " + " | ".join(_grid_col_seps(data_rows, nc)) + " |"]
     for r in data_rows:
         out.append("| " + " | ".join(r) + " |")
     return out
@@ -1506,6 +1631,1147 @@ def _page_has_grid(pdf_path, page: int) -> bool:
     return bool(grids)
 
 
+# ── A(2026-07-13): 넓은 grid 표 캡션 밀착(FMDW_WIDE_TABLE_CAPTION_BIND, 기본 ON) ────
+# 넓은 grid 표(ncol≥8) 바로 위, 빈 줄로 분리된 '단일 캡션/설명 라인'을 표에 밀착(사이 빈 줄
+# 제거)해 RAG 청크 문맥을 강화한다. 폭 변화가 목적이 아니며 셀·열수·텍스트 전부 불변(빈 줄 1개
+# 제거뿐). 오결합(무관 문단 흡수) 방지: PDF find_tables bbox 상단 y 에 '근접한 단일 라인'만
+# 결합(_caption_binds_to_table). 캡션이 없으면 no-op.
+def _wide_caption_bind_enabled() -> bool:
+    return os.getenv("FMDW_WIDE_TABLE_CAPTION_BIND", "1").strip().lower() not in (
+        "0", "false", "off", "no")
+
+
+def _table_ncols_from_header(line: str) -> int:
+    return len(line.split("|")) - 2
+
+
+def _caption_binds_to_table(page, tbbox) -> bool:
+    """PDF 근접 게이트(오결합 방지). 표 bbox 상단 y 바로 위에, 표와 x-범위가 겹치는 '단일 라인'
+    텍스트 블록이 있고, 그 블록이 (자신의 위쪽 이웃보다) 표에 더 밀착해 있으면 True.
+    다중행 문단·멀리 떨어진 문단은 거부 → 무관 문단 흡수 차단."""
+    try:
+        x0, y0, x1, _y1 = tbbox
+        cand = []
+        for b in page.get_text("dict").get("blocks", []):
+            if "lines" not in b:
+                continue
+            bb = b["bbox"]
+            if bb[2] < x0 - 2 or bb[0] > x1 + 2:   # 표 x-범위와 가로로 겹쳐야
+                continue
+            if bb[3] <= y0 + 1:                    # 블록 하단이 표 상단보다 위
+                cand.append(b)
+        if not cand:
+            return False
+        nb = max(cand, key=lambda b: b["bbox"][3])   # 표에 가장 가까운(아래쪽) 블록
+        hlines = [l for l in nb["lines"] if abs(l.get("dir", (1, 0))[1]) <= 0.2]
+        if len(hlines) != 1:                         # 캡션 = 단일 라인만
+            return False
+        gap_below = y0 - nb["bbox"][3]
+        if gap_below < 0:
+            return False
+        above = [b for b in cand if b is not nb and b["bbox"][3] <= nb["bbox"][1] + 1]
+        if not above:
+            return True                              # 위에 아무 것도 없음 → 캡션 확실
+        nb2 = max(above, key=lambda b: b["bbox"][3])
+        gap_above = nb["bbox"][1] - nb2["bbox"][3]
+        return gap_below <= gap_above * 0.9          # 표에 더 밀착해야 결합
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _bind_wide_table_captions(pdf_path, page: int, out_text, grids_info):
+    """넓은 grid 표(ncol≥8) 위의 단일 캡션 라인을 표에 밀착(빈 줄 제거). 위 도크스트링 참조."""
+    if not _wide_caption_bind_enabled() or not out_text:
+        return out_text
+    lines = out_text.split("\n")
+    wide = [(bs, be) for (bs, be) in _find_gfm_blocks(lines)
+            if _table_ncols_from_header(lines[bs]) >= 8]
+    if not wide:
+        return out_text
+    try:
+        import fitz
+        doc = fitz.open(str(pdf_path))
+    except Exception:  # noqa: BLE001
+        return out_text
+
+    def _is_caption_line(idx):
+        if idx < 0:
+            return False
+        st = lines[idx].strip()
+        if not st or st[0] in "|#>" or st.startswith("<!-- ") \
+                or st.startswith("- ") or st.startswith("* ") or st.startswith("•") \
+                or _MD_STYLE_FENCE_RE.match(lines[idx]):
+            return False
+        return True
+
+    def _isolated_above(idx):
+        # 캡션 위 줄이 빈줄/헤딩/마커/펜스/표/문서시작 → 단일 고립 라인(다중행 문단 아님)
+        if idx <= 0:
+            return True
+        p = lines[idx - 1].strip()
+        return (not p) or p[0] in "|#" or p.startswith("<!-- ") \
+            or bool(_MD_STYLE_FENCE_RE.match(lines[idx - 1]))
+
+    remove_blanks = []
+    try:
+        pg = doc[page - 1]
+        grid_headers = [set(_sig_tokens(" ".join(g[0]))) for (g, _b) in grids_info]
+        for (bs, _be) in wide:
+            if bs < 2 or lines[bs - 1].strip() != "":   # 표 바로 위가 빈 줄이어야
+                continue
+            cap = bs - 2
+            if not _is_caption_line(cap) or not _isolated_above(cap):
+                continue
+            htok = set(_sig_tokens(lines[bs]))          # 이 표↔grid bbox 매칭(헤더 토큰)
+            if not htok:
+                continue
+            best_gi, best_ov = None, 0.0
+            for gi, gh in enumerate(grid_headers):
+                if not gh:
+                    continue
+                ov = len(htok & gh) / min(len(htok), len(gh))
+                if ov > best_ov:
+                    best_ov, best_gi = ov, gi
+            if best_gi is None or best_ov < 0.5:
+                continue
+            if _caption_binds_to_table(pg, grids_info[best_gi][1]):
+                remove_blanks.append(bs - 1)
+    finally:
+        doc.close()
+    if not remove_blanks:
+        return out_text
+    drop = set(remove_blanks)
+    print(f"    [GRID] p{page}: 넓은표 캡션 밀착(A) {len(drop)}건", flush=True)
+    return "\n".join(l for k, l in enumerate(lines) if k not in drop)
+
+
+def _grid_insert_unmatched_enabled() -> bool:
+    """미매칭 well-formed grid 위치삽입 폴백(P1, 2026-07-13) 토글. 기본 ON.
+
+    0/false/off/no 면 폴백 비활성 → 기존 동작(미매칭 grid 드롭) 100% 복원(롤백)."""
+    return os.getenv("FMDW_GRID_INSERT_UNMATCHED", "1").strip().lower() not in (
+        "0", "false", "off", "no")
+
+
+def _dup_table_anchor_enabled() -> bool:
+    """중복 glm 표 앵커 재배치(FMDW_DUP_TABLE_ANCHOR, 2026-07-15) 토글. 기본 ON.
+
+    증상: 소형 로컬 모델(glm)이 같은 표를 페이지 안에서 2회 이상 전사(예: 상단 완전판
+    사본 + 캡션 아래 불완전판 사본). _apply_grid_tables 의 path(1) greedy 매칭이
+    '헤더 토큰 겹침 최대' 사본을 먼저 grid 로 splice 해버려, 캡션·섹션 문맥이 붙은
+    진짜 자리에는 glm 불완전 사본이 그대로 남는 역전 구조가 생긴다(RAG 치명).
+
+    처리: 한 grid 에 헤더 겹침 ≥0.5 인 후보 |-블록이 2개 이상이면, greedy 최댓값이
+    아니라 'PDF 벡터 캡션(ground truth) 인접' 후보를 승자로 골라 grid 를 splice 하고,
+    나머지 중복 사본은 삭제한다(단 다른 grid 와도 ≥0.5 겹치면 다른 표일 수 있어 보존).
+    벡터 캡션 판독 실패·후보 1개면 기존 greedy 100% 유지(보수).
+
+    0/false/off/no 면 무동작 → path(1) 기존 greedy 동작 바이트 동일 복원."""
+    return os.getenv("FMDW_DUP_TABLE_ANCHOR", "1").strip().lower() not in (
+        "0", "false", "off", "no")
+
+
+# ── (b)(c) 페이지걸침표 캡션 오배치 수정(FMDW_STRADDLE_CAPTION_DEDUP, 기본 ON) ────────
+#     2026-07-13. P1(미매칭 grid 위치삽입) 위에 얹는 후처리 — 코드영역 분리(P1/C1/A/ToC 불변).
+#
+#     증상: glm 본문이 '캡션 없는 연속표(t0 = 직전 페이지에서 걸쳐 내려온 표의 꼬리)'를 페이지
+#     최상단에서 만나면, 그 아래 '3.2.x 헤딩 + Table N: 캡션'을 t0 위로 hoist 해 잘못 붙이고
+#     (캡션①), 진짜 새 표(t1)에서 캡션을 재출력(캡션②)한다. 결과 조립 순서는
+#     [헤딩][캡션①][t0][캡션②][t1] — Table N 캡션이 byte-identical 로 2회 등장하고 3.2.x
+#     헤딩이 연속분(t0) 위에 오배치된다. _apply_grid_tables 는 in-place splice 라 이 잘못된
+#     순서를 그대로 보존한다.
+#
+#     교정: 연속분 신호(페이지 첫 grid 의 bbox 상단 y0 가 콘텐츠 최상단이며, 직전 페이지 마지막
+#     grid 와 열수+헤더토큰 스키마 일치)를 CPU 저비용으로 확인하고, 그 조건이 참일 때만
+#       (b) hoist 된 가짜 캡션①(byte-identical 중복) 라인을 삭제하고,
+#       (c) 캡션① 직상단의 3.2.x(섹션) 헤딩을 연속분 grid(t0) 아래로 이동해
+#     최종 순서 [t0][3.2.x 헤딩][Table N 캡션][t1] 을 복원한다. 표 데이터·텍스트는 불변
+#     (순서·중복 캡션만 조정). 게이트 미충족(정상 반복헤더 등)이면 무동작.
+#     FMDW_STRADDLE_CAPTION_DEDUP=0 이면 (b)(c) 모두 무동작(P1 포함 기존 동작 바이트 동일).
+_STRADDLE_CAP_RE = re.compile(r"^\s*(?:\*\*)?\s*Table\s+(\d+)\s*[:.]", re.IGNORECASE)
+_STRADDLE_HEADING_RE = re.compile(r"^\s*#{1,6}\s+\S")
+# 연속분 판정: 페이지 첫 grid bbox 상단 y0 가 이 값 이하이면 '콘텐츠 최상단' 으로 본다.
+_STRADDLE_TOP_Y0_MAX = 110.0
+
+
+def _straddle_dedup_enabled() -> bool:
+    """페이지걸침표 캡션 dedup/헤딩 재배치((b)(c)) 토글. 기본 ON.
+
+    0/false/off/no 면 (b)(c) 둘 다 무동작 → P1 포함 기존 동작 100% 복원(바이트 동일)."""
+    return os.getenv("FMDW_STRADDLE_CAPTION_DEDUP", "1").strip().lower() not in (
+        "0", "false", "off", "no")
+
+
+def _page_is_straddle_continuation(pdf_path, page: int, grids_info) -> bool:
+    """이 페이지가 '직전 페이지에서 걸쳐 내려온 표의 연속분'으로 시작하는지 판정(CPU 저비용).
+
+    신호 = (1) 페이지 첫 grid(y0 최소)의 bbox 상단 y0 ≤ _STRADDLE_TOP_Y0_MAX(콘텐츠 최상단)
+           且 (2) _grid_page_info(pdf, page-1) 의 마지막 grid 와 열수 일치 + 헤더 토큰
+                 스키마 일치(겹침율 ≥ 0.7). 둘 다 참일 때만 True(그 외 전부 False, 보수)."""
+    if page <= 1 or not grids_info:
+        return False
+    first = min(grids_info, key=lambda gb: gb[1][1])
+    if (first[1][1] or 0.0) > _STRADDLE_TOP_Y0_MAX:
+        return False
+    try:
+        prev_grids, _ph, _n = _grid_page_info(pdf_path, page - 1)
+    except Exception:  # noqa: BLE001
+        return False
+    if not prev_grids:
+        return False
+    last_prev = max(prev_grids, key=lambda gb: gb[1][1])
+    cur_hdr, prev_hdr = first[0][0], last_prev[0][0]
+    if len(cur_hdr) != len(prev_hdr):     # 열수 불일치 → 다른 표
+        return False
+    cur_tok = set(_sig_tokens(" ".join(cur_hdr)))
+    prev_tok = set(_sig_tokens(" ".join(prev_hdr)))
+    if not cur_tok or not prev_tok:
+        return False
+    ov = len(cur_tok & prev_tok) / min(len(cur_tok), len(prev_tok))
+    return ov >= 0.7
+
+
+def _straddle_caption_dedup(pdf_path, page: int, md, grids_info):
+    """(b) hoist 된 중복 캡션 삭제 + (c) 3.2.x 헤딩 재배치. 위 블록 도크스트링 참조.
+
+    발동 = 페이지 연속분 신호 충족(_page_is_straddle_continuation) 且 md 안에서 'Table N:'
+    캡션이 정확히 2회 byte-identical 且 첫 캡션(=최초 등장)이 연속분 grid(t0 = 페이지 최상단
+    표 블록) 바로 위(사이 빈 줄만) 且 둘째 캡션이 t0 뒤(그 뒤에 또 다른 표 t1 존재)인 구조일
+    때만. 구조 불일치·게이트 OFF 면 md 를 그대로 반환(무변경). 표 데이터·텍스트 불변."""
+    if not _straddle_dedup_enabled() or not md:
+        return md
+    if not _page_is_straddle_continuation(pdf_path, page, grids_info):
+        return md
+    lines = md.split("\n")
+    blocks = _find_gfm_blocks(lines)
+    if len(blocks) < 2:                    # t0, t1 최소 2개 표 블록 필요
+        return md
+    t0_start, t0_end = blocks[0]           # 페이지 최상단 표 블록 = 연속분 t0
+    cap_idx = [i for i, l in enumerate(lines) if _STRADDLE_CAP_RE.match(l)]
+    del_lines = set()
+    move_heading = None                    # (heading_idx, insert_after_idx=t0_end)
+    changed = False
+    for c1 in cap_idx:
+        if c1 >= t0_start:                 # 캡션①은 t0 위여야
+            continue
+        if any(lines[k].strip() for k in range(c1 + 1, t0_start)):
+            continue                       # 캡션①↔t0 사이는 빈 줄만(직상단 hoist)
+        same = [j for j in cap_idx if lines[j] == lines[c1]]
+        if len(same) != 2 or same[0] != c1:    # 정확히 2회 byte-identical, c1 이 최초
+            continue
+        c2 = same[1]
+        if t0_end >= c2:                   # 둘째 캡션은 t0 뒤여야
+            continue
+        if not any(bs > c2 for (bs, _be) in blocks):   # 둘째 캡션 뒤에 t1 표 존재
+            continue
+        del_lines.add(c1)                  # (b) hoist 된 가짜 캡션① 삭제
+        h = c1 - 1                         # (c) 캡션① 직상단(빈 줄 건너뛰고) 헤딩 탐색
+        while h >= 0 and not lines[h].strip():
+            h -= 1
+        if h >= 0 and _STRADDLE_HEADING_RE.match(lines[h]) \
+                and not any(lines[k].strip() for k in range(h + 1, c1)):
+            move_heading = (h, t0_end)     # 헤딩을 t0 아래로 이동
+            del_lines.add(h)
+        changed = True
+        break                              # 페이지당 1건(연속분 t0 는 최상단 1개)
+    if not changed:
+        return md
+    raw = []
+    for idx, l in enumerate(lines):
+        if idx in del_lines:
+            continue
+        raw.append(l)
+        if move_heading is not None and idx == move_heading[1]:
+            raw.append("")
+            raw.append(lines[move_heading[0]])
+    out = []                               # 교정 페이지 한정 연속 빈 줄 축약(데이터 불변)
+    for l in raw:
+        if not l.strip() and out and not out[-1].strip():
+            continue
+        out.append(l)
+    print(f"    [GRID] p{page}: 페이지걸침표 캡션 dedup"
+          f"{' + 헤딩 재배치' if move_heading else ''}(b/c)", flush=True)
+    return "\n".join(out)
+
+
+# ── F-CAPTION-DET(2026-07-13): grid 표 캡션 결정론 검증(FMDW_CAPTION_DET, 기본 ON) ──
+#     설계: 05_Leolsi/03_DOC/design/fmdw-pipeline-improvement-caption-grid-260713.md §2.
+#     원칙(창작 금지): 표 캡션(Table/Figure N)은 '그 캡션 문자열이 같은 페이지 PDF
+#     벡터텍스트에 실재'할 때만 신뢰한다. 소형(8B) 로컬 모델이 자유생성/호이스트한
+#     캡션(다음 섹션 캡션 앞당김·중복 삽입)을 결정론적으로 제거한다:
+#       (1) grid 표 블록 '직상단(사이 빈 줄만)'의 캡션형 라인만 검사(본문 산문 불변).
+#       (2) 같은 페이지 벡터텍스트에 같은 (Table|Figure)+번호 시작 라인이 없으면 →
+#           삭제(창작/호이스트). 연속 표(원본 캡션 없음)는 캡션 없이 표만 남는다.
+#       (3) 실재하면 '그 벡터 캡션 바로 아래(y-근접) grid'에만 귀속 — 다른 grid 위의
+#           사본은 삭제(결정론 dedup). 페이지 경계 차단 = 검색 범위가 그 페이지 한정.
+#     표 셀·본문 텍스트 불변(캡션 라인 삭제만). 설계서의 '캡션 폰트 티어(F8/F10) 일치'
+#     검사는 채택하지 않음 — 본 문서군(LN08LPU)의 캡션은 본문 폰트와 동일 크기라
+#     티어 검사가 실재 캡션을 오탐 제거할 위험이 있고, '같은 페이지 실재 + bbox y-근접
+#     귀속'이 더 강한 결정론이다(원칙 유지: 같은 페이지 벡터텍스트 실재 검증·창작 금지).
+#     알려진 한계(Advisor R2): 캡션이 라스터 이미지 속이고 표만 벡터인 하이브리드
+#     페이지(저빈도)에선 실재 캡션이 벡터 미실재로 판정되어 오삭제될 수 있다.
+_CAPDET_MD_RE = re.compile(
+    r"^\s*(?:\*\*)?\s*(Table|Figure)\s+(\d+)\s*[:.]", re.IGNORECASE)
+_CAPDET_VEC_RE = re.compile(r"^(Table|Figure)\s+(\d+)\b", re.IGNORECASE)
+
+
+def _caption_det_enabled() -> bool:
+    """F-CAPTION-DET 토글. 0/false/off/no 면 무동작(기존 동작 바이트 동일)."""
+    return os.getenv("FMDW_CAPTION_DET", "1").strip().lower() not in (
+        "0", "false", "off", "no")
+
+
+def _page_vector_captions(pdf_path, page: int):
+    """해당 페이지 벡터텍스트의 실재 캡션 라인 [(kind, num, y1)] — 수평(비회전)만.
+
+    F1 규약 준수: 회전(대각선 워터마크) 라인 제외. 실패 시 빈 리스트(보수 — 빈
+    리스트면 캡션 존재 확인이 불가하므로 호출부는 '실재 불명' 삭제를 하지 않는다)."""
+    caps = []
+    try:
+        import fitz
+
+        doc = fitz.open(str(pdf_path))
+    except Exception:  # noqa: BLE001
+        return caps, False
+    ok = True
+    try:
+        pg = doc[page - 1]
+        for b in pg.get_text("dict").get("blocks", []):
+            for ln in b.get("lines", []):
+                if abs(ln.get("dir", (1, 0))[1]) > 0.2:   # F1: 회전 텍스트 제외
+                    continue
+                text = "".join(s.get("text", "") for s in ln.get("spans", [])).strip()
+                m = _CAPDET_VEC_RE.match(text)
+                if m:
+                    bb = ln.get("bbox", (0, 0, 0, 0))
+                    caps.append((m.group(1).lower(), int(m.group(2)), bb[3]))
+    except Exception:  # noqa: BLE001
+        ok = False
+    finally:
+        doc.close()
+    return caps, ok
+
+
+def _apply_caption_det(pdf_path, page: int, md, grids_info):
+    """grid 표 직상단 캡션의 결정론 검증/제거(위 블록 주석 참조). OFF/실패 = 무변경."""
+    if not _caption_det_enabled() or not md or not grids_info:
+        return md
+    lines = md.split("\n")
+    blocks = _find_gfm_blocks(lines)
+    if not blocks:
+        return md
+    # 블록 ↔ grid bbox 매칭(헤더 토큰 겹침 ≥0.5 — _bind_wide_table_captions 와 동일 방식)
+    grid_headers = [set(_sig_tokens(" ".join(g[0]))) for (g, _b) in grids_info]
+    block_bbox = {}
+    used_g = set()
+    for (bs, be) in blocks:
+        htok = set(_sig_tokens(lines[bs]))
+        if not htok:
+            continue
+        best_gi, best_ov = None, 0.0
+        for gi, gh in enumerate(grid_headers):
+            if gi in used_g or not gh:
+                continue
+            ov = len(htok & gh) / min(len(htok), len(gh))
+            if ov > best_ov:
+                best_ov, best_gi = ov, gi
+        if best_gi is not None and best_ov >= 0.5:
+            block_bbox[(bs, be)] = grids_info[best_gi][1]
+            used_g.add(best_gi)
+    if not block_bbox:
+        return md
+    vec_caps, vec_ok = _page_vector_captions(pdf_path, page)
+    if not vec_ok:
+        return md                     # 벡터텍스트 판독 실패 → 판단 불가, 무변경(보수)
+    all_bboxes = [b for (_g, b) in grids_info]
+
+    def _owner_bbox(kind, num):
+        """벡터 캡션(kind,num) 바로 아래(y-근접)의 grid bbox = 캡션의 정당한 소유 표."""
+        best_b, best_gap = None, None
+        for (k, n, vy1) in vec_caps:
+            if k != kind or n != num:
+                continue
+            for b in all_bboxes:
+                gap = b[1] - vy1
+                if gap >= -5 and (best_gap is None or gap < best_gap):
+                    best_gap, best_b = gap, b
+        return best_b
+
+    del_lines = set()
+    for (bs, _be) in blocks:
+        bbox = block_bbox.get((bs, _be))
+        if bbox is None:
+            continue
+        c = bs - 1
+        while c >= 0 and not lines[c].strip():
+            c -= 1                    # 직상단(빈 줄만 건너뜀) 라인
+        if c < 0 or c in del_lines:
+            continue
+        m = _CAPDET_MD_RE.match(lines[c])
+        if not m:
+            continue
+        kind, num = m.group(1).lower(), int(m.group(2))
+        if not any(v[0] == kind and v[1] == num for v in vec_caps):
+            del_lines.add(c)          # (2) 같은 페이지 벡터텍스트 미실재 = 창작/호이스트
+            print(f"    [CAPDET] p{page}: 벡터텍스트 미실재 캡션 제거 "
+                  f"'{lines[c].strip()[:60]}'", flush=True)
+            continue
+        owner = _owner_bbox(kind, num)
+        if owner is not None and owner != bbox:
+            del_lines.add(c)          # (3) 실재하나 다른 grid 소유 → 사본 제거(dedup)
+            print(f"    [CAPDET] p{page}: 캡션 오귀속 사본 제거 "
+                  f"'{lines[c].strip()[:60]}'", flush=True)
+    if not del_lines:
+        return md
+    extra = set()                     # 삭제 자리 이중 빈 줄 축약(삭제 주변 한정)
+    for d in del_lines:
+        if 0 < d < len(lines) - 1 and not lines[d - 1].strip() \
+                and not lines[d + 1].strip():
+            extra.add(d + 1)
+    del_lines |= extra
+    return "\n".join(l for k, l in enumerate(lines) if k not in del_lines)
+
+
+# ── F-XPAGE(R4', 2026-07-14): 페이지 걸침 표의 소속(귀속) 결함 해소(FMDW_XPAGE_CONT) ──
+#     실사례(LN08LPU DM_p0018-0047 p22→p23): 직전 페이지 표의 연속분(캡션 없음, 헤더만
+#     반복)이 페이지 최상단에 오는데 glm 이 다음 절 헤딩(### 3.2.6)을 표 위로 hoist →
+#     (a) CONTCAP(_apply_caption_continuation)의 '페이지 첫 콘텐츠=캡션 없는 표' 조건이
+#         깨져 '(continued)' 캡션 미삽입(소속 불명),
+#     (b) 기존 (c) 헤딩 재배치(_straddle_caption_dedup)는 (b) 'byte-identical 캡션 2회'
+#         구조에서만 발동 — 가짜 캡션이 CAPDET 경로로 제거된 경우 미발동.
+#     수정 2종(모두 FMDW_XPAGE_CONT 게이트, "0"=완전 비활성·기존 동작 바이트 동일):
+#       F-BLOCK-ORDER: 연속분 페이지(_page_is_straddle_continuation)에서 첫 grid 표 위에
+#         hoist 된 헤딩 라인을, 같은 페이지 PDF 벡터텍스트의 실측 y 좌표가 '표 하단보다
+#         아래'임이 확인될 때만 표 블록 바로 뒤(원본 y 순서)로 재배치. 창작 0(라인 이동만).
+#       F-XPAGE-CONT: doc 레벨 CONTCAP 확장(2차 패스) — 아래 _apply_caption_continuation.
+def _xpage_cont_enabled() -> bool:
+    """F-XPAGE 토글. 0/false/off/no 면 두 수정 모두 무동작(기존 동작 바이트 동일)."""
+    return os.getenv("FMDW_XPAGE_CONT", "1").strip().lower() not in (
+        "0", "false", "off", "no")
+
+
+_XPAGE_NORM_RE = re.compile(r"[^a-z0-9]+")
+
+
+def _xpage_norm(s: str) -> str:
+    """헤딩↔벡터라인 대조용 정규화(영숫자 소문자만 — 공백/기호/마크업 무시)."""
+    return _XPAGE_NORM_RE.sub("", (s or "").lower())
+
+
+def _xpage_page_vec_lines(pdf_path, page: int):
+    """페이지 벡터텍스트 수평 라인 [(norm_text, y0, y1)] (F1: 회전 워터마크 제외).
+
+    실패 시 ([], False) — 호출부는 판단 불가로 무동작(보수)."""
+    out = []
+    try:
+        import fitz
+
+        doc = fitz.open(str(pdf_path))
+    except Exception:  # noqa: BLE001
+        return out, False
+    ok = True
+    try:
+        pg = doc[page - 1]
+        for b in pg.get_text("dict").get("blocks", []):
+            for ln in b.get("lines", []):
+                if abs(ln.get("dir", (1, 0))[1]) > 0.2:   # F1: 회전 텍스트 제외
+                    continue
+                text = "".join(s.get("text", "") for s in ln.get("spans", [])).strip()
+                if text:
+                    bb = ln.get("bbox", (0, 0, 0, 0))
+                    out.append((_xpage_norm(text), bb[1], bb[3]))
+    except Exception:  # noqa: BLE001
+        ok = False
+    finally:
+        doc.close()
+    return out, ok
+
+
+# ── F-XPAGE-REG(R5, 2026-07-14): 표 정체성 원장(table registry) 결정론 후처리 ─────
+# 개별 스팟픽스 대신 단일 메커니즘(doc 레벨, 페이지 마커 세그먼트 단위):
+#   (1) 원장 구축: 페이지별 grid 표(find_tables, y순) + 벡터 'Table N:' 캡션(원문·y,
+#       회전 워터마크 제외) + 캡션→grid 귀속(CAPDET 와 동일 y-근접 규칙).
+#   (2) 캡션 복원(벡터 증거, 창작 0): 벡터 실재 캡션이 md 에 없으면 owner 표 블록 직전에
+#       '**<벡터 원문>**' 복원. glm 유실 + CAPDET 오귀속-사본-삭제(이동 아닌 삭제 결함)로
+#       0개가 된 캡션(LN08LPU p6 Table 3 / p8 Table 4 / p28 Table 9·10) 해소.
+#   (3) continued 바인딩 = 지문 전용: 페이지 첫 grid 가 ①물리 최상단(y0≤임계) ②자기
+#       벡터 캡션 없음 ③직전 페이지 마지막 grid 와 헤더 지문(정규화 셀) 완전 일치일 때만
+#       직전 open 표의 연속으로 확정 → '**Table N: <원제목> (continued)**' 삽입.
+#       최근성(recency) 바인딩 금지 — 지문 불일치면 무캡션 + QA 노트(사람 검수).
+#   (4) 캡션 헤딩화 정정: '### Table N: ...' 등 헤딩형으로 변질된 캡션(F11b 승격 사고
+#       또는 glm 전사 변이)을 벡터 원문 굵은 캡션으로 정규화.
+#   (5) 블록 순서 = 원본 y: 연속분 첫 표 블록을 페이지 선두로, hoist 된 헤딩은 벡터 y
+#       가 가리키는 표 블록 앞으로 재배치(고유 매칭 실패 라인은 불이동 — 보수).
+#   (6) 빈 표 파편 가드: 데이터 행 0개(헤더+구분선만/고아 구분선) 블록 미방출.
+# 전부 FMDW_XPAGE_CONT 게이트("0"=완전 비활성, 기존 동작 바이트 동일). 표 셀·산문 불변.
+_XPAGE_CAPLINE_RE = re.compile(
+    r"^\s*(#{1,6}\s*)?\**\s*(Table|Figure)\s+(\d+)\s*[:.]", re.IGNORECASE)
+_XPAGE_SEP_RE = re.compile(r"^\s*\|[\s:|\-]+\|\s*$")
+XPAGE_QA_NOTES = []   # 파일 단위(process_file 시작 시 clear) — _qa.json 에 기록
+
+
+def _xpage_vec_table_captions(pdf_path, page: int):
+    """페이지 벡터텍스트의 'Table N:' 캡션 [(num:int, text, y0, y1)] (수평만). (list, ok)"""
+    out = []
+    try:
+        import fitz
+
+        doc = fitz.open(str(pdf_path))
+    except Exception:  # noqa: BLE001
+        return out, False
+    ok = True
+    try:
+        pg = doc[page - 1]
+        for b in pg.get_text("dict").get("blocks", []):
+            for ln in b.get("lines", []):
+                if abs(ln.get("dir", (1, 0))[1]) > 0.2:   # F1: 회전 제외
+                    continue
+                text = "".join(s.get("text", "") for s in ln.get("spans", [])).strip()
+                m = re.match(r"^Table\s+(\d+)\s*[:.]", text, re.IGNORECASE)
+                if m:
+                    bb = ln.get("bbox", (0, 0, 0, 0))
+                    out.append((int(m.group(1)), text, bb[1], bb[3]))
+    except Exception:  # noqa: BLE001
+        ok = False
+    finally:
+        doc.close()
+    return out, ok
+
+
+def _xpage_blocks_with_html(body: list):
+    """세그먼트의 표성 블록 [(start, end, kind)] — GFM 블록 + raw html <table 라인."""
+    blocks = [(s, e, "gfm") for (s, e) in _find_gfm_blocks(body)]
+    for i, l in enumerate(body):
+        if l.lstrip().startswith("<table"):
+            blocks.append((i, i, "html"))
+    return sorted(blocks)
+
+
+def _xpage_match_blocks_to_grids(body, blocks, grids):
+    """블록↔grid 매핑(dict block_idx→grid_idx). 1차: 첫 데이터행 지문, 2차: 순서(수 일치 시).
+
+    이 문서군은 표 헤더가 전부 동일해 헤더 매칭이 무의미 — 데이터 행으로 식별한다."""
+    def _row_fp(cells):
+        return _XPAGE_NORM_RE.sub("", "".join(cells).lower())
+
+    gfp = {}
+    for gi, (g, _b) in enumerate(grids):
+        cand_rows = list(g[1:5])   # 2단 헤더(서브헤더 행) 충돌 회피 — 초반 여러 행을 키로
+        # F-SUBROW(R7): 병합판 초반 행 지문도 등록 — md 는 병합 렌더, glm/HTML 원문은
+        # 비병합이라 양쪽 다 매칭되도록 union(같은 gi 중복 등록은 dedup — 모호성 오탐 방지).
+        mg, _mb = _subrow_merge_rows(g)
+        cand_rows += list(mg[1:5])
+        seen_fp = set()
+        for r in cand_rows:
+            fp = _row_fp([c or "" for c in r])
+            if fp and fp not in seen_fp:
+                seen_fp.add(fp)
+                gfp.setdefault(fp, []).append(gi)
+    mapping = {}
+    used = set()
+    for bi, (s, e, kind) in enumerate(blocks):
+        fp = None
+        if kind == "gfm":
+            for k in range(s, e + 1):
+                if not _XPAGE_SEP_RE.match(body[k]) and k > s:
+                    fp = _row_fp(_cc_cells(body[k]))
+                    break
+        else:
+            # html 표: 첫 데이터행 전체를 태그 제거 후 지문화(그리드와 동일 규칙)
+            parts = body[s].split("</tr>")
+            if len(parts) >= 2:
+                fp = _XPAGE_NORM_RE.sub(
+                    "", re.sub(r"<[^>]+>", "", parts[1]).lower())
+        cand = gfp.get(fp, []) if fp else []
+        cand = [gi for gi in cand if gi not in used]
+        if len(cand) == 1:
+            mapping[bi] = cand[0]
+            used.add(cand[0])
+    if not mapping and len(blocks) == len(grids):
+        mapping = {i: i for i in range(len(blocks))}
+    else:
+        # html 파편 등 잔여: 수 일치 시 순서 보간(미사용 grid 를 미매핑 블록에 순서대로)
+        rem_b = [bi for bi in range(len(blocks)) if bi not in mapping]
+        rem_g = [gi for gi in range(len(grids)) if gi not in used]
+        if len(rem_b) == len(rem_g):
+            for bi, gi in zip(rem_b, rem_g):
+                mapping[bi] = gi
+    return mapping
+
+
+def _xpage_registry_pass(md: str, pdf_path) -> str:
+    """표 정체성 원장 후처리(위 블록 주석 (1)~(6)). OFF/증거 부족 = 해당 항목 무변경."""
+    if not md or pdf_path is None or not _xpage_cont_enabled():
+        return md
+    segments = _cc_segment(md)
+    changed_any = False
+    open_tbl = None          # (num, title) — 직전 페이지 마지막 grid 의 소속 표
+    prev_last_hdr = None     # 직전 페이지 마지막 grid 헤더 셀
+    for si in range(len(segments)):
+        pg = segments[si][1]
+        if pg is None:
+            continue
+        body = list(segments[si][2])
+        try:
+            grids, _ph, _n = _grid_page_info(pdf_path, pg)
+        except Exception:  # noqa: BLE001
+            grids = []
+        grids = sorted(grids, key=lambda gb: gb[1][1])
+        caps, vec_ok = _xpage_vec_table_captions(pdf_path, pg)
+        if not grids:
+            open_tbl, prev_last_hdr = None, None
+            continue
+        if not vec_ok:
+            open_tbl, prev_last_hdr = None, grids[-1][0][0]
+            XPAGE_QA_NOTES.append(f"p{pg}: vector read failed — registry skipped")
+            continue
+        # ── 원장: 캡션→grid 귀속(y-근접) ──
+        gcap = {}
+        for (num, text, _y0, y1) in sorted(caps, key=lambda c: c[3]):
+            best_gap, best_gi = None, None
+            for gi, (_g, b) in enumerate(grids):
+                gap = b[1] - y1
+                if gap >= -5 and (best_gap is None or gap < best_gap):
+                    best_gap, best_gi = gap, gi
+            if best_gi is not None and best_gi not in gcap:
+                gcap[best_gi] = (num, text)
+        first_hdr = grids[0][0][0]
+        is_cont = (open_tbl is not None and 0 not in gcap
+                   and (grids[0][1][1] or 0.0) <= _STRADDLE_TOP_Y0_MAX
+                   and prev_last_hdr is not None
+                   and len(first_hdr) == len(prev_last_hdr)
+                   and _cc_norm_cells(first_hdr) == _cc_norm_cells(prev_last_hdr))
+        if (open_tbl is not None and 0 not in gcap and not is_cont
+                and (grids[0][1][1] or 0.0) <= _STRADDLE_TOP_Y0_MAX):
+            XPAGE_QA_NOTES.append(
+                f"p{pg}: top table has no caption and fingerprint mismatch — "
+                "left uncaptioned (human review)")
+        changed = False
+
+        # ── (4) 캡션 헤딩화/형식 정정 + (2) 복원 준비: 기존 md 캡션 넘버 수집 ──
+        def _cap_nums():
+            nums = set()
+            for l in body:
+                mm = _XPAGE_CAPLINE_RE.match(l)
+                if mm and "(continued)" not in l.lower() \
+                        and not l.lstrip().startswith("|"):
+                    nums.add(int(mm.group(3)))
+            return nums
+
+        vec_by_num = {}
+        for (num, text, _y0, _y1) in caps:
+            vec_by_num.setdefault(num, text)
+        for i, l in enumerate(body):
+            mm = _XPAGE_CAPLINE_RE.match(l)
+            if not mm or "(continued)" in l.lower() or l.lstrip().startswith("|"):
+                continue
+            num = int(mm.group(3))
+            if num in vec_by_num:
+                want = f"**{vec_by_num[num]}**"
+                if l.strip() != want and _xpage_norm(l) == _xpage_norm(vec_by_num[num]):
+                    body[i] = want
+                    changed = True
+        # ── (0) CONT 페이지 b0 직상단의 '남의 캡션' 제거(CAPDET 크로스블록 보완) ──
+        # glm hoist 로 연속분 위에 남은 비-continued 캡션의 벡터 owner grid 가 첫 grid
+        # 가 아니면 사본/오귀속 — 삭제(사본 2개면 owner 쪽 1개가 남고, 유일본이었다면
+        # 아래 (2) 복원이 owner 블록 위에 벡터 원문으로 재배치한다. 순삭제 아님).
+        if is_cont:
+            while True:
+                blocks0 = _xpage_blocks_with_html(body)
+                if not blocks0:
+                    break
+                k = blocks0[0][0] - 1
+                while k >= 0 and _cc_is_skip(body[k].strip()):
+                    k -= 1
+                mm0 = _XPAGE_CAPLINE_RE.match(body[k]) if k >= 0 else None
+                if not mm0 or "(continued)" in body[k].lower():
+                    break
+                num0 = int(mm0.group(3))
+                owner0 = next((gi for gi, v in gcap.items() if v[0] == num0), None)
+                if owner0 is None or owner0 == 0:
+                    break
+                print(f"    [XPAGE-REG] p{pg}: 연속분 위 오귀속 캡션 제거 "
+                      f"'{body[k].strip()[:60]}'", flush=True)
+                del body[k]
+                changed = True
+        # ── (2) 벡터 실재 캡션 복원 ──
+        blocks = _xpage_blocks_with_html(body)
+        mapping = _xpage_match_blocks_to_grids(body, blocks, grids)
+        have = _cap_nums()
+        inserts = []          # (line_idx, [lines])
+        for gi, (num, text) in sorted(gcap.items()):
+            if num in have:
+                continue
+            tgt = next((bi for bi, g in mapping.items() if g == gi), None)
+            if tgt is None:
+                XPAGE_QA_NOTES.append(f"p{pg}: caption 'Table {num}' restore skipped "
+                                      "(block-grid match fail)")
+                continue
+            ins_at = blocks[tgt][0]
+            if blocks[tgt][1] > blocks[tgt][0] or blocks[tgt][2] == "html":
+                # html 블록 직전의 위반 마커 주석 위로 올려 캡션이 표 머리에 오게 한다
+                k = ins_at - 1
+                while k >= 0 and (not body[k].strip() or body[k].lstrip().startswith("<!--")):
+                    if body[k].lstrip().startswith("<!--"):
+                        ins_at = k
+                    k -= 1
+            inserts.append((ins_at, [f"**{text}**", ""]))
+            print(f"    [XPAGE-REG] p{pg}: 벡터 실재 캡션 복원 '**Table {num}: ...**'",
+                  flush=True)
+        # ── (2b) 미반영 well-formed grid 결정론 삽입(데이터 = find_tables 벡터 진실) ──
+        # glm 이 표를 산문으로 전사(| 앵커 0)해 F11 이 못 반영한 grid(LN08LPU p28
+        # Table 10 사고)를 캡션 앵커(실재 md 캡션 라인) 뒤 또는 직전 grid 블록 뒤에
+        # 삽입. 산문 전사분은 삭제하지 않음(산문 불변 원칙 — QA 노트로 사람 확인).
+        mapped_g = set(mapping.values())
+        for gi in range(len(grids)):
+            if gi in mapped_g or not _table_well_formed(grids[gi][0]):
+                continue
+            gfm_lines = _render_grid_gfm(grids[gi][0])
+            payload = []
+            anchor = None
+            centry = gcap.get(gi)
+            if centry:
+                cnum, ctext = centry
+                for i2, l2 in enumerate(body):
+                    mm2 = _XPAGE_CAPLINE_RE.match(l2)
+                    if (mm2 and int(mm2.group(3)) == cnum
+                            and "(continued)" not in l2.lower()
+                            and not l2.lstrip().startswith("|")):
+                        anchor = i2 + 1
+                        break
+                if anchor is None and cnum not in have:
+                    payload += [f"**{ctext}**", ""]
+            if gi == 0 and is_cont and open_tbl is not None and not payload:
+                n0, t0 = open_tbl
+                payload += [(f"**Table {n0}: {t0} (continued)**" if t0
+                             else f"**Table {n0} (continued)**"), ""]
+            payload += gfm_lines
+            if anchor is None:
+                prev_bi = next((bi for bi, g2 in mapping.items() if g2 == gi - 1), None)
+                anchor = (blocks[prev_bi][1] + 1) if prev_bi is not None \
+                    else (0 if gi == 0 else len(body))
+            inserts.append((anchor, [""] + payload + [""]))
+            XPAGE_QA_NOTES.append(
+                f"p{pg}: grid {gi} had no md table (prose-transcribed) — inserted "
+                "find_tables GFM; prose duplicate left for human review")
+            print(f"    [XPAGE-REG] p{pg}: 미반영 grid {gi} → find_tables GFM 삽입"
+                  f"(행 {len(grids[gi][0])})", flush=True)
+        # ── (3) continued 삽입(지문 전용) ──
+        if is_cont and blocks and mapping.get(0) == 0:
+            b0s = blocks[0][0]
+            k = b0s - 1
+            while k >= 0 and _cc_is_skip(body[k].strip()):
+                k -= 1
+            has_cap_above = k >= 0 and bool(_XPAGE_CAPLINE_RE.match(body[k]))
+            if not has_cap_above:
+                num, title = open_tbl
+                cont = (f"**Table {num}: {title} (continued)**" if title
+                        else f"**Table {num} (continued)**")
+                inserts.append((b0s, [cont, ""]))
+                print(f"    [XPAGE-REG] p{pg}: 지문 일치 연속분 → '{cont[:70]}' 삽입",
+                      flush=True)
+        if inserts:
+            for ins_at, ls in sorted(inserts, reverse=True):
+                body[ins_at:ins_at] = ls
+            changed = True
+        # ── (5a) 연속분 첫 표 블록(+직상단 캡션)을 페이지 선두로 ──
+        if is_cont:
+            blocks = _xpage_blocks_with_html(body)
+            if blocks and blocks[0][2] == "gfm":
+                s0, e0, _ = blocks[0]
+                cs = s0
+                k = s0 - 1
+                while k >= 0 and not body[k].strip():
+                    k -= 1
+                if k >= 0 and _XPAGE_CAPLINE_RE.match(body[k]):
+                    cs = k
+                lead = [l for l in body[:cs] if l.strip()]
+                if lead:
+                    moved = body[cs:e0 + 1]
+                    rest = body[:cs] + body[e0 + 1:]
+                    while rest and not rest[0].strip():
+                        rest.pop(0)
+                    body = moved + [""] + rest
+                    changed = True
+                    print(f"    [XPAGE-REG] p{pg}: 연속분 표 블록 → 페이지 선두 재배치",
+                          flush=True)
+        # ── (5b) 헤딩/캡션 라인을 벡터 y 슬롯(해당 표 블록 앞)으로 ──
+        vec_lines, vl_ok = _xpage_page_vec_lines(pdf_path, pg)
+        if vl_ok and vec_lines:
+            blocks = _xpage_blocks_with_html(body)
+            mapping = _xpage_match_blocks_to_grids(body, blocks, grids)
+            grid_y0 = {bi: grids[g][1][1] for bi, g in mapping.items()}
+            move_ops = []      # (line_idx, target_block_idx, y)
+            for i, l in enumerate(body):
+                st = l.strip()
+                if not st or l.lstrip().startswith("|"):
+                    continue
+                is_head = bool(_STRADDLE_HEADING_RE.match(l))
+                if not is_head:
+                    continue
+                hn = _xpage_norm(re.sub(r"^\s*#{1,6}\s*", "", l))
+                hits = [(y0, y1) for (t, y0, y1) in vec_lines if t == hn]
+                if len(hits) != 1:
+                    continue
+                y = hits[0][0]
+                tgt = None
+                for bi in sorted(grid_y0, key=lambda b2: grid_y0[b2]):
+                    if grid_y0[bi] > y:
+                        tgt = bi
+                        break
+                if tgt is None:
+                    continue
+                s_t = blocks[tgt][0]
+                # 이미 올바른 슬롯(자기 표 블록 위, 사이에 다른 표 블록 없음)이면 불이동
+                in_slot = (i < s_t) and not any(
+                    i < bs < s_t for (bs, _be, _k2) in blocks)
+                if not in_slot:
+                    move_ops.append((i, tgt, y))
+            if move_ops:
+                idxs = {i for (i, _t, _y) in move_ops}
+                kept = [l for k2, l in enumerate(body) if k2 not in idxs]
+                nb = _xpage_blocks_with_html(kept)
+                mapping2 = _xpage_match_blocks_to_grids(kept, nb, grids)
+                for (_i, tgt, y) in sorted(move_ops, key=lambda t: -t[2]):
+                    line = body[_i]
+                    gi_t = mapping.get(tgt)
+                    tbi = next((bi for bi, g in mapping2.items() if g == gi_t), None)
+                    if tbi is None:
+                        kept.append(line)
+                        continue
+                    at = nb[tbi][0]
+                    k = at - 1
+                    while k >= 0 and (not kept[k].strip()
+                                      or _XPAGE_CAPLINE_RE.match(kept[k])):
+                        if _XPAGE_CAPLINE_RE.match(kept[k]):
+                            at = k
+                        k -= 1
+                    kept[at:at] = [line, ""]
+                    nb = _xpage_blocks_with_html(kept)
+                    mapping2 = _xpage_match_blocks_to_grids(kept, nb, grids)
+                body = kept
+                changed = True
+                print(f"    [XPAGE-REG] p{pg}: 헤딩 {len(move_ops)}건 벡터 y 슬롯 재배치",
+                      flush=True)
+        # ── (6) 빈 표 파편 가드 ──
+        drop = set()
+        for (s, e) in _find_gfm_blocks(body):
+            data = [k for k in range(s, e + 1)
+                    if not _XPAGE_SEP_RE.match(body[k])]
+            if len(data) <= 1 and (e - s) <= 2:   # 헤더만/구분선만 = 데이터 0
+                drop.update(range(s, e + 1))
+        if drop:
+            XPAGE_QA_NOTES.append(f"p{pg}: dropped {len(drop)} empty-table fragment lines")
+            body = [l for k2, l in enumerate(body) if k2 not in drop]
+            changed = True
+            print(f"    [XPAGE-REG] p{pg}: 빈 표 파편 {len(drop)}줄 제거", flush=True)
+        # ── (7) F-DUP(R7, 2026-07-14): 중복 미니표(glm 요약 아티팩트) 제거 ──
+        # 조건(전부 충족 시에만 제거 — 보수): ①무캡션(직상단 비스킵 라인이 Table/Figure
+        # 캡션 아님) ②grid 미매핑 gfm 블록 ③데이터 행 ≥2 ④'전' 데이터 행이 같은 페이지
+        # '매핑된 표' 행들의 셀 부분열(subsequence — 열 투영 요약도 검출, p8 실측 3열
+        # 미니표=Table 4 의 4열 중 3열 투영). 원본 실재 표는 ④에서 탈락(비중복 셀 존재).
+        blocks = _xpage_blocks_with_html(body)
+        mapping = _xpage_match_blocks_to_grids(body, blocks, grids)
+        mapped_rows_cells = []
+        for bi, (s, e, kind) in enumerate(blocks):
+            if kind != "gfm" or bi not in mapping:
+                continue
+            for k2 in range(s, e + 1):
+                if not _XPAGE_SEP_RE.match(body[k2]):
+                    rc = [_xpage_norm(c) for c in _cc_cells(body[k2]) if _xpage_norm(c)]
+                    if rc:
+                        mapped_rows_cells.append(rc)
+
+        def _is_cell_subseq(small, big):
+            it = iter(big)
+            return all(c in it for c in small)
+
+        drop_dup = set()
+        for bi, (s, e, kind) in enumerate(blocks):
+            if kind != "gfm" or bi in mapping or not mapped_rows_cells:
+                continue
+            k2 = s - 1
+            while k2 >= 0 and _cc_is_skip(body[k2].strip()):
+                k2 -= 1
+            if k2 >= 0 and _XPAGE_CAPLINE_RE.match(body[k2]):
+                continue                    # 캡션 있는 표는 보존(원본 실재 가능성)
+            data_rows = []
+            for k3 in range(s + 1, e + 1):
+                if _XPAGE_SEP_RE.match(body[k3]):
+                    continue
+                rc = [_xpage_norm(c) for c in _cc_cells(body[k3]) if _xpage_norm(c)]
+                if rc:
+                    data_rows.append(rc)
+            if len(data_rows) < 2:
+                continue
+            if all(any(_is_cell_subseq(r, mr) for mr in mapped_rows_cells)
+                   for r in data_rows):
+                drop_dup.update(range(s, e + 1))
+                XPAGE_QA_NOTES.append(
+                    f"p{pg}: dropped duplicate mini-table ({len(data_rows)} rows — "
+                    "무캡션·grid 미매핑·매핑 표 행의 셀 부분열, F-DUP)")
+                print(f"    [XPAGE-REG] p{pg}: 중복 미니표 제거(행 {len(data_rows)}, "
+                      "F-DUP)", flush=True)
+        if drop_dup:
+            body = [l for k2, l in enumerate(body) if k2 not in drop_dup]
+            changed = True
+        # ── 빈 줄 정리(연속 2+ → 1, 편집 페이지 한정) ──
+        if changed:
+            cleaned = []
+            for l in body:
+                if not l.strip() and cleaned and not cleaned[-1].strip():
+                    continue
+                cleaned.append(l)
+            segments[si][2] = cleaned
+            changed_any = True
+        # ── 체인 상태 갱신 ──
+        last_gi = len(grids) - 1
+        if last_gi in gcap:
+            n, t = gcap[last_gi]
+            title = re.sub(r"^Table\s+\d+\s*[:.]\s*", "", t, flags=re.IGNORECASE).strip()
+            open_tbl = (str(n), title)
+        else:
+            # 마지막 grid 에 자기 캡션이 없으면: 페이지 내 최근 캡션(y 가 그 grid 위) 또는
+            # 연속 체인 유지. 캡션이 하나도 없고 연속도 아니면 체인 단절(None).
+            owner = None
+            for gi in range(last_gi, -1, -1):
+                if gi in gcap:
+                    owner = gcap[gi]
+                    break
+            if owner is not None:
+                title = re.sub(r"^Table\s+\d+\s*[:.]\s*", "", owner[1],
+                               flags=re.IGNORECASE).strip()
+                open_tbl = (str(owner[0]), title)
+            elif not is_cont:
+                open_tbl = None
+        prev_last_hdr = grids[-1][0][0]
+    if not changed_any:
+        return md
+    out = []
+    for marker, _pg, body in segments:
+        if marker is not None:
+            out.append(marker)
+        out.extend(body)
+    return "\n".join(out)
+
+
+# ── F-DOCLING(R6, 2026-07-14): find_tables 최종 실패 표의 Docling 폴백 ─────────────
+# 발동 = env FMDW_TABLE_FALLBACK=docling 일 때만(미설정 = 완전 무동작, 기존 바이트 동일).
+# 대상 = glm 이 raw HTML 로 전사했는데 지문 일치 find_tables grid 가 없는 표(R5 의
+# HTML→GFM 교체가 못 미치는 구멍). Docling(전용 .docling-venv, TableFormerMode.ACCURATE
+# 고정 — FAST 는 행 밀림 실측으로 금지)을 subprocess 로 호출해 '표 구조(행/열/스팬)'만
+# 차용한다. 본문/헤딩/캡션은 기존 파이프라인 그대로(통째 대체 금지 — R2 함정).
+#   - 셀 텍스트 = 셀 bbox 안 수평 벡터텍스트 재추출(_grid_clean_cell 재사용 — 회전
+#     워터마크 '기하' 세정, 어휘 매칭 금지. 실험서 'ml.ko' 셀 오염 실측 대응).
+#   - 헤더 = column_header 행들을 열별 '{그룹명} {부라벨}' 완전수식 단일 헤더로 합성.
+#   - provenance: _qa.json 에 table_fallback: docling 기록 + [DOCLING] 로그.
+DOCLING_FALLBACK_USED = []      # [{"page":N,"table":i}] — 파일 단위(process_file 시 clear)
+_DOCLING_CACHE = {}
+
+
+def _table_fallback_engine() -> str:
+    return os.getenv("FMDW_TABLE_FALLBACK", "").strip().lower()
+
+
+def _docling_venv_python():
+    p = Path(__file__).parent / ".docling-venv" / "bin" / "python"
+    return str(p) if p.exists() else None
+
+
+def _docling_page_tables(pdf_path, page: int):
+    """해당 페이지 1장 미니 PDF → Docling ACCURATE 표 구조 목록. 실패/OFF = [] (캐시)."""
+    key = (str(pdf_path), page)
+    if key in _DOCLING_CACHE:
+        return _DOCLING_CACHE[key]
+    result = []
+    py = _docling_venv_python()
+    if _table_fallback_engine() != "docling" or not py:
+        _DOCLING_CACHE[key] = result
+        return result
+    import json as _json
+    import subprocess
+    import tempfile
+
+    tf_name = None
+    try:
+        import fitz
+
+        src = fitz.open(str(pdf_path))
+        mini = fitz.open()
+        mini.insert_pdf(src, from_page=page - 1, to_page=page - 1)
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tf:
+            tf_name = tf.name
+        mini.save(tf_name)
+        mini.close()
+        src.close()
+        r = subprocess.run(
+            [py, str(Path(__file__).parent / "docling_table_helper.py"), tf_name],
+            capture_output=True, text=True,
+            timeout=int(os.getenv("FMDW_DOCLING_TIMEOUT", "300")))
+        if r.returncode != 0 or "{" not in r.stdout:
+            print(f"    [DOCLING] p{page}: helper 실패(rc={r.returncode}) — "
+                  "기존 경로 유지", flush=True)
+        else:
+            data = _json.loads(r.stdout[r.stdout.find("{"):])
+            result = data.get("tables", [])
+            print(f"    [DOCLING] p{page}: ACCURATE 표 {len(result)}개 구조 인식"
+                  f"({data.get('elapsed', '?')}s)", flush=True)
+    except Exception as e:  # noqa: BLE001 — 폴백 실패는 비차단(기존 경로 유지)
+        print(f"    [DOCLING] p{page}: 예외 — 기존 경로 유지: {e}", flush=True)
+        result = []
+    finally:
+        if tf_name and os.path.exists(tf_name):
+            os.unlink(tf_name)
+    _DOCLING_CACHE[key] = result
+    return result
+
+
+def _docling_table_to_gfm(pdf_path, page: int, tbl):
+    """Docling 표 1개 → GFM 라인 리스트(실패 시 None). 구조=Docling, 텍스트=벡터 재추출."""
+    grid = tbl.get("grid") or []
+    if len(grid) < 2:
+        return None
+    import fitz
+
+    doc = fitz.open(str(pdf_path))
+    try:
+        pg = doc[page - 1]
+        _rot_cache = []
+        _rot_done = [False]
+
+        def _rotated_boxes():
+            """페이지의 회전(비수평) 벡터 라인 bbox — 워터마크 기하 증거(캐시)."""
+            if not _rot_done[0]:
+                for b in pg.get_text("dict").get("blocks", []):
+                    for ln in b.get("lines", []):
+                        if abs(ln.get("dir", (1, 0))[1]) > 0.2:
+                            _rot_cache.append(ln.get("bbox", (0, 0, 0, 0)))
+                _rot_done[0] = True
+            return _rot_cache
+
+        def _is_subseq(a, b):
+            it = iter(b)
+            return all(ch in it for ch in a)
+
+        def cell_text(c):
+            """셀 텍스트 = 셀 bbox 안 수평 벡터텍스트(F1 기하 세정) 우선.
+
+            예외(병합셀 bbox 어긋남으로 fitz 추출이 '조각'일 때): Docling 원문 채택은
+            '회전 라인이 셀 bbox 와 무교차'라는 기하 증거가 있을 때만(워터마크 유입
+            불가 보장 — 어휘 매칭 없음). 교차하면 조각이라도 fitz 값 유지(보수)."""
+            bb = c.get("bbox")
+            dt = (c.get("text") or "").strip()
+            ft = ""
+            if bb:
+                try:
+                    ft = (_grid_clean_cell(pg, tuple(bb)) or "").strip()
+                except Exception:  # noqa: BLE001
+                    ft = ""
+            if ft:
+                fn, dn = _xpage_norm(ft), _xpage_norm(dt)
+                if (dt and len(fn) < 0.6 * len(dn) and _is_subseq(fn, dn) and bb
+                        and not any(not (rb[2] < bb[0] or rb[0] > bb[2]
+                                         or rb[3] < bb[1] or rb[1] > bb[3])
+                                    for rb in _rotated_boxes())):
+                    return dt
+                return ft
+            return dt                     # 벡터 부재(래스터) 시에만 Docling 텍스트
+
+        n_hdr = 0
+        for r in grid:
+            if any(c.get("col_header") for c in r):
+                n_hdr += 1
+            else:
+                break
+        n_hdr = max(1, n_hdr)
+        ncols = max(len(r) for r in grid)
+        headers = []
+        for j in range(ncols):
+            parts = []
+            for r in grid[:n_hdr]:
+                t = re.sub(r"\s+", " ",
+                           cell_text(r[j]) if j < len(r) else "").strip()
+                if t and (not parts or _xpage_norm(t) != _xpage_norm(parts[-1])):
+                    parts.append(t)      # '{그룹명} {부라벨}' 완전수식(중복 그룹명 1회)
+            headers.append(" ".join(parts).replace("|", "\\|").strip())
+        rows = []
+        for r in grid[n_hdr:]:
+            rows.append([re.sub(r"\s+", " ",
+                                cell_text(r[j]) if j < len(r) else "")
+                         .strip().replace("|", "\\|") for j in range(ncols)])
+        keep = [j for j in range(ncols)
+                if headers[j] or any(rr[j] for rr in rows)]   # 전 열 빈 유령 열 제거
+        if len(keep) < 2 or not rows:
+            return None
+        headers = [headers[j] for j in keep]
+        rows = [[rr[j] for j in keep] for rr in rows]
+        out = ["| " + " | ".join(headers) + " |",
+               "| " + " | ".join([":---"] * len(keep)) + " |"]
+        out += ["| " + " | ".join(rr) + " |" for rr in rows]
+        return out
+    finally:
+        doc.close()
+
+
+def _docling_replace_html_spans(pdf_path, page: int, body_md):
+    """잔존 raw <table> 스팬을 Docling 폴백 GFM 으로 교체(식별 실패 span 은 원문 유지).
+
+    식별 = html 첫 데이터행 지문이 Docling 표의 데이터행 지문에 실재. 페이지에 html
+    1개·Docling 표 1개뿐이면(미니 PDF 단일 표) 지문 없이도 1:1 로 간주."""
+    if _table_fallback_engine() != "docling" or "<table" not in body_md:
+        return body_md
+    spans = list(re.finditer(r"<table\b.*?</table>", body_md,
+                             re.IGNORECASE | re.DOTALL))
+    if not spans:
+        return body_md
+    tables = _docling_page_tables(pdf_path, page)
+    if not tables:
+        return body_md
+    gfms = []
+    for tbl in tables:
+        g = _docling_table_to_gfm(pdf_path, page, tbl)
+        if g:
+            rowfps = {_XPAGE_NORM_RE.sub("", l.replace("|", "").lower())
+                      for l in g[2:]}
+            gfms.append((tbl, g, rowfps))
+    if not gfms:
+        return body_md
+
+    def _html_first_td_fp(s):
+        for ch in re.split(r"<tr[^>]*>", s, flags=re.IGNORECASE):
+            if "<td" in ch.lower():
+                return _XPAGE_NORM_RE.sub(
+                    "", re.sub(r"<[^>]+>", " ", ch.split("</tr>")[0]).lower())
+        return None
+
+    out, last, did = [], 0, 0
+    for m in spans:
+        fp = _html_first_td_fp(m.group(0))
+        best = None
+        cand = [(tbl, g) for (tbl, g, rfps) in gfms if fp and fp in rfps]
+        if len(cand) == 1:
+            best = cand[0]
+        elif len(spans) == 1 and len(gfms) == 1:
+            best = (gfms[0][0], gfms[0][1])
+        out.append(body_md[last:m.start()])
+        if best is not None:
+            out.append("\n".join(best[1]))
+            did += 1
+            DOCLING_FALLBACK_USED.append({"page": page, "table": best[0].get("index")})
+            XPAGE_QA_NOTES.append(
+                f"p{page}: table_fallback=docling(ACCURATE) — raw HTML 표를 "
+                "Docling 구조+벡터텍스트 GFM 으로 교체")
+            print(f"    [DOCLING] p{page}: raw HTML 표 → Docling 폴백 GFM 교체"
+                  f"(표 {best[0].get('index')})", flush=True)
+        else:
+            out.append(m.group(0))      # 식별 모호 → 원문 유지(보수)
+        last = m.end()
+    if not did:
+        return body_md
+    out.append(body_md[last:])
+    return "".join(out)
+
+
 def _apply_grid_tables(pdf_path, page: int, body_md):
     """find_tables 표를 본문에 반영(F11). 배치 전략(회귀 최소):
 
@@ -1519,9 +2785,49 @@ def _apply_grid_tables(pdf_path, page: int, body_md):
         return body_md
     grids_info, ph, n_nontable = _grid_page_info(pdf_path, page)
     if not grids_info:
+        # F-DOCLING(R6): find_tables 전면 미검출 페이지의 raw HTML 표 폴백(OFF=무동작).
+        if _table_fallback_engine() == "docling" and "<table" in body_md:
+            body_md = _docling_replace_html_spans(pdf_path, page, body_md)
         return body_md
     grids_info = sorted(grids_info, key=lambda gb: gb[1][1])  # 읽기순(bbox y0)
     rendered = [_render_grid_gfm(g) for (g, _b) in grids_info]
+    # R5(FMDW_XPAGE_CONT 게이트): glm 이 금지된 raw HTML 표로 전사한 블록을, 첫 데이터행
+    # 지문이 일치하는 find_tables 그리드의 GFM 으로 결정론 교체(셀 데이터 = 벡터 진실,
+    # 창작 0). 교체 후엔 기존 앵커 매칭 로직이 GFM 을 정상 처리한다. 미일치 = 보존(플래그).
+    if _xpage_cont_enabled() and "<table" in body_md:
+        def _html_fp(span: str):
+            chunks = re.split(r"<tr[^>]*>", span, flags=re.IGNORECASE)
+            for ch in chunks:
+                if "<td" in ch.lower():
+                    return _XPAGE_NORM_RE.sub("", re.sub(r"<[^>]+>", " ", ch).lower())
+            return None
+
+        def _grid_fps(g):
+            fps = {_XPAGE_NORM_RE.sub("", "".join(c or "" for c in r).lower())
+                   for r in g[1:4]}
+            mg, _mb = _subrow_merge_rows(g)   # F-SUBROW(R7): 병합판 지문도 등록
+            fps |= {_XPAGE_NORM_RE.sub("", "".join(c or "" for c in r).lower())
+                    for r in mg[1:4]}
+            return fps
+
+        new_body, last, did = [], 0, 0
+        for mhtml in re.finditer(r"<table\b.*?</table>", body_md,
+                                 re.IGNORECASE | re.DOTALL):
+            fp = _html_fp(mhtml.group(0))
+            tgt = next((gi for gi, (g, _b) in enumerate(grids_info)
+                        if fp and fp in _grid_fps(g)), None)
+            new_body.append(body_md[last:mhtml.start()])
+            if tgt is not None:
+                new_body.append("\n".join(rendered[tgt]))
+                did += 1
+            else:
+                new_body.append(mhtml.group(0))
+            last = mhtml.end()
+        if did:
+            new_body.append(body_md[last:])
+            body_md = "".join(new_body)
+            print(f"    [XPAGE-REG] p{page}: raw HTML 표 {did}개 → find_tables GFM 교체",
+                  flush=True)
     lines = body_md.split("\n")
 
     # (0) grid-only 페이지 → 본문 전체를 그리드로 대체(마커/헤딩/캡션만 보존)
@@ -1536,18 +2842,114 @@ def _apply_grid_tables(pdf_path, page: int, body_md):
             out.extend(r)
         print(f"    [GRID] p{page}: grid-only 페이지 → find_tables 표 "
               f"{len(rendered)}개로 본문 대체(F11)", flush=True)
-        return "\n".join(out).strip("\n") + "\n"
+        # F-CAPTION-DET: grid-only 경로에도 캡션 결정론 검증 적용(창작 캡션 제거).
+        return _apply_caption_det(
+            pdf_path, page, "\n".join(out).strip("\n") + "\n", grids_info)
 
     # (1)+(2) glm |-블록 splice
     blocks = _find_gfm_blocks(lines)
     used = set()
     replacements = {}
     matched = [False] * len(grids_info)
+    grid_line = {}   # gi -> 배치된 replacement 시작 라인(P1 위치삽입 앵커용)
+    dup_delete_end = {}   # {loser bs: be} — 중복 glm 표 사본 삭제 대상(FMDW_DUP_TABLE_ANCHOR)
+    # ── 중복 glm 표 앵커(FMDW_DUP_TABLE_ANCHOR): 사전계산(캡션 ground truth) ──
+    _dup_enabled = _dup_table_anchor_enabled()
+    grid_hdr_tokens = [set(_sig_tokens(" ".join(g[0]))) for (g, _b) in grids_info]
+    vec_caps_dup, vec_ok_dup, owner_of, md_caps = [], False, {}, []
+    if _dup_enabled:
+        # 벡터 캡션(kind,num,y1) 실재 + 각 캡션의 정당 소유 grid(캡션 y1 바로 아래 최근접).
+        vec_caps_dup, vec_ok_dup = _page_vector_captions(pdf_path, page)
+        if vec_ok_dup:
+            for (vk, vn, vy1) in vec_caps_dup:
+                b_gi, b_gap = None, None
+                for gj, (_g, gb) in enumerate(grids_info):
+                    gap = gb[1] - vy1
+                    if gap >= -5 and (b_gap is None or gap < b_gap):
+                        b_gap, b_gi = gap, gj
+                if b_gi is not None:
+                    prev = owner_of.get((vk, vn))
+                    if prev is None or b_gap < prev[1]:
+                        owner_of[(vk, vn)] = (b_gi, b_gap)
+        # MD 내 캡션형 라인(Table/Figure N) 위치(2차 신호 = MD 캡션 인접).
+        for _ci, _cl in enumerate(lines):
+            _cm = _CAPDET_MD_RE.match(_cl)
+            if _cm:
+                md_caps.append((_ci, _cm.group(1).lower(), int(_cm.group(2))))
+
+    def _first_nonblank_after(cidx):
+        j = cidx + 1
+        while j < len(lines) and not lines[j].strip():
+            j += 1
+        return j
+
+    def _owned_kn(gi):
+        """grid gi 가 벡터 캡션 ground truth 로 소유한 (kind, num). 없으면 None."""
+        if vec_ok_dup:
+            for kn, (ogi, _gap) in owner_of.items():
+                if ogi == gi:
+                    return kn
+        return None
+
+    def _select_dup_winner(gi, cands):
+        """중복 후보 중 '캡션 인접' 승자 선택. 없으면 None(→ greedy 유지)."""
+        # (1) 벡터 캡션 ground truth: grid gi 가 소유한 캡션(k,n) → 그 MD 캡션 직하 후보.
+        target_kn = _owned_kn(gi)
+        if target_kn is not None:
+            for (cidx, ck, cn) in md_caps:
+                if (ck, cn) != target_kn:
+                    continue
+                j = _first_nonblank_after(cidx)
+                for cb in cands:
+                    if cb[0] == j:
+                        return cb
+        # (3) 2차 신호: 임의 MD 캡션(Table/Figure N) 직하(빈 줄 허용) 후보.
+        for (cidx, ck, cn) in md_caps:
+            j = _first_nonblank_after(cidx)
+            for cb in cands:
+                if cb[0] == j:
+                    return cb
+        return None
+
+    def _loser_overlaps_other_grid(bs, gi):
+        """패자 사본이 gi 외 다른 grid 헤더와도 ≥0.5 겹치면 다른 표일 수 있음(삭제 금지)."""
+        htok = set(_sig_tokens(lines[bs]))
+        if not htok:
+            return False
+        for gj in range(len(grids_info)):
+            if gj == gi:
+                continue
+            gh = grid_hdr_tokens[gj]
+            if gh and len(htok & gh) / min(len(htok), len(gh)) >= 0.5:
+                return True
+        return False
+
+    def _caption_immediately_above(bs):
+        """bs 직상단(빈 줄 허용) 캡션형 라인(Table/Figure N:)의 (kind, num). 없으면 None."""
+        j = bs - 1
+        while j >= 0 and not lines[j].strip():
+            j -= 1
+        if j < 0:
+            return None
+        m = _CAPDET_MD_RE.match(lines[j])
+        if not m:
+            return None
+        return (m.group(1).lower(), int(m.group(2)))
+
+    def _loser_has_distinct_caption(bs, gi):
+        """패자 직상단에 승자 grid(gi) 가 소유하지 않은 별개 Table/Figure N: 캡션이 있으면
+        borderless 별개 표(find_tables 미검출이라 grid 없음)일 수 있음 → 삭제 금지(보존)."""
+        cap = _caption_immediately_above(bs)
+        if cap is None:
+            return False
+        return cap != _owned_kn(gi)
+
     for gi, (grid, _b) in enumerate(grids_info):
-        ht = set(_sig_tokens(" ".join(grid[0])))
+        ht = grid_hdr_tokens[gi]
         if not ht:
             continue
-        best, best_ov = None, 0.0
+        # 후보 = 미사용 |-블록 중 헤더 토큰 겹침 ≥0.5(기존 best_ov≥0.5 게이트와 동치집합).
+        cands, ovmap = [], {}
         for (bs, be) in blocks:
             if (bs, be) in used:
                 continue
@@ -1555,13 +2957,47 @@ def _apply_grid_tables(pdf_path, page: int, body_md):
             if not gt:
                 continue
             ov = len(ht & gt) / min(len(ht), len(gt))
-            if ov > best_ov:
-                best_ov, best = ov, (bs, be)
-        if best and best_ov >= 0.5:
+            if ov >= 0.5:
+                cands.append((bs, be))
+                ovmap[(bs, be)] = ov
+        if not cands:
+            continue
+        if _dup_enabled and len(cands) >= 2:
+            # 중복 전사 감지: 캡션 인접 사본 승자 + 나머지 사본 제거(보수 가드).
+            winner = _select_dup_winner(gi, cands)
+            # 삭제 게이트(이슈2): 캡션 근거로 승자를 확정했을 때만 아래 삭제 실행.
+            # greedy 폴백(None)이면 삭제 없이 배치만(기존 동작 보존).
+            winner_by_caption = winner is not None
+            if winner is None:
+                winner = max(cands, key=lambda c: ovmap[c])   # 캡션 신호 없음 → greedy 유지
+            replacements[winner[0]] = (winner[1], _splice_glm_header(
+                rendered[gi], lines[winner[0]:winner[1] + 1], grids_info[gi][0]))
+            used.add(winner)
+            matched[gi] = True
+            grid_line[gi] = winner[0]
+            n_del = 0
+            if winner_by_caption:
+                for cb in cands:
+                    if cb == winner:
+                        continue
+                    if _loser_overlaps_other_grid(cb[0], gi):
+                        continue   # 다른 표일 수 있음 → 보존
+                    if _loser_has_distinct_caption(cb[0], gi):
+                        continue   # 이슈1: 패자 직상단 별개 캡션 → 별개 표로 보존
+                    dup_delete_end[cb[0]] = cb[1]
+                    used.add(cb)
+                    n_del += 1
+            if n_del:
+                print(f"    [DUPTBL] p{page}: grid#{gi} 중복 glm 표 {len(cands)}개 "
+                      f"→ 캡션인접 1개 채택, 사본 {n_del}개 제거", flush=True)
+        else:
+            # 기존 greedy(단일 후보 또는 토글 OFF): 최대 겹침 블록 splice(동작 불변).
+            best = max(cands, key=lambda c: ovmap[c])
             replacements[best[0]] = (best[1], _splice_glm_header(
                 rendered[gi], lines[best[0]:best[1] + 1], grids_info[gi][0]))
             used.add(best)
             matched[gi] = True
+            grid_line[gi] = best[0]
     # (2) 미매칭 표 ↔ 남은 블록: '내용 포함(containment)' 확인 후에만 짝지어 교체.
     #     glm 이 같은 표를 뭉갠 경우 그 블록 토큰은 표 전체 토큰의 부분집합 → 높은 포함율.
     #     무관한 다른 표(예 p149-151 Abbreviation grid ↔ Level 블록)는 포함율 낮아 미짝(오교체 방지).
@@ -1585,6 +3021,7 @@ def _apply_grid_tables(pdf_path, page: int, body_md):
                 rendered[gi], lines[best_b[0]:best_b[1] + 1], grids_info[gi][0]))
             used.add(best_b)
             matched[gi] = True
+            grid_line[gi] = best_b[0]
     # (3) PATH 3(2026-07-10): glm 이 검출된 격자표를 `|`-블록이 아니라 '불릿/산문'으로 낸 경우.
     #     path0/1/2 미배치 격자에 대해, 비-표(`|`아님)·비-펜스·비-헤딩·비-마커 라인의 '연속 run'
     #     중 격자 셀 토큰과 '양방향 강매칭'(≥0.7 & ≥0.7) 且 길이≈행수(±1) 인 run 을 표로 교체.
@@ -1651,11 +3088,96 @@ def _apply_grid_tables(pdf_path, page: int, body_md):
                 replacements[best_run[0]] = (best_run[1], rendered[gi])
                 used_runs.add(best_run)
                 matched[gi] = True
-    if not replacements:
+                grid_line[gi] = best_run[0]
+    # ── P1(2026-07-13): 미매칭 well-formed grid 위치삽입 폴백 ─────────────────
+    #     find_tables 가 well-formed 로 검출했으나 glm 앵커 부재(path0~3 미매칭)로
+    #     지금까지 silent drop 되던 격자표를, bbox y0 읽기순 위치(페이지 마커/기배치
+    #     grid 상대)에 rendered GFM(교체 아닌 '삽입')으로 되살린다.
+    #     중복 오삽입 가드: 격자 토큰이 본문의 |-블록/산문·불릿 run 에 containment≥0.5
+    #     로 이미 존재하면 미삽입(중복 방지). rendered 는 _render_grid_gfm 산출이라
+    #     C1(FMDW_NUMERIC_COL_ALIGN) 정렬이 이미 반영된다(일관).
+    insertions = {}   # {삽입기준 라인 idx: [gfm 블록, ...]} — 해당 라인 '앞'에 삽입
+    if _grid_insert_unmatched_enabled() and any(
+            (not matched[gi]) and _table_well_formed(grids_info[gi][0])
+            for gi in range(len(grids_info))):
+        # 중복 가드용 본문 콘텐츠 유닛: |-블록(blocks) + 비어있지 않은 산문/불릿 run.
+        content_runs = []
+        _ci = 0
+        while _ci < len(lines):
+            _cst = lines[_ci].strip()
+            if _cst and not _cst.startswith("|"):
+                _cj = _ci
+                while (_cj < len(lines) and lines[_cj].strip()
+                       and not lines[_cj].lstrip().startswith("|")):
+                    _cj += 1
+                content_runs.append((_ci, _cj - 1))
+                _ci = _cj
+            else:
+                _ci += 1
+        unit_tokens = [set(_sig_tokens(" ".join(lines[bs:be + 1])))
+                       for (bs, be) in blocks]
+        unit_tokens += [set(_sig_tokens(" ".join(lines[rs:re_ + 1])))
+                        for (rs, re_) in content_runs]
+
+        def _grid_already_present(_gi):
+            gt = grid_all[_gi]
+            if not gt:
+                return True   # 토큰 없으면 삽입 의미 없음 → 스킵
+            for ut in unit_tokens:
+                if ut and len(gt & ut) / len(gt) >= 0.5:
+                    return True
+            return False
+
+        _pm = next((k for k, l in enumerate(lines)
+                    if l.strip().startswith("<!-- page")), None)
+        n_ins = 0
+        for gi in range(len(grids_info)):   # grids_info 는 y0 오름차순(읽기순)
+            if matched[gi] or not _table_well_formed(grids_info[gi][0]):
+                continue
+            if _grid_already_present(gi):
+                continue
+            # 앵커: 아래(더 큰 y0)에 기배치 grid 가 있으면 그 시작줄 '앞',
+            #       없고 위에 기배치 grid 가 있으면 그 끝줄 '뒤',
+            #       기배치 grid 전무면 페이지 마커 뒤(없으면 본문 끝).
+            below = next((gj for gj in range(gi + 1, len(grids_info))
+                          if gj in grid_line), None)
+            above = next((gj for gj in range(gi - 1, -1, -1)
+                          if gj in grid_line), None)
+            if below is not None:
+                anchor = grid_line[below]
+            elif above is not None:
+                anchor = replacements[grid_line[above]][0] + 1
+            elif _pm is not None:
+                anchor = _pm + 1
+            else:
+                anchor = len(lines)
+            insertions.setdefault(anchor, []).append(rendered[gi])
+            matched[gi] = True
+            n_ins += 1
+        if n_ins:
+            print(f"    [GRID] p{page}: 미매칭 well-formed 표 {n_ins}개 위치삽입(P1)",
+                  flush=True)
+
+    if not replacements and not insertions and not dup_delete_end:
         return body_md
     out = []
     i = 0
     while i < len(lines):
+        if i in insertions:
+            for _blk in insertions[i]:
+                if out and out[-1].strip():
+                    out.append("")
+                out.extend(_blk)
+                out.append("")
+        # 중복 glm 표 사본 삭제(FMDW_DUP_TABLE_ANCHOR): 블록 제거 + 주변 빈 줄 단일화.
+        _de = dup_delete_end.get(i)
+        if _de is not None:
+            j = _de + 1
+            if out and not out[-1].strip():   # 직전이 빈 줄이면 이어지는 빈 줄 흡수
+                while j < len(lines) and not lines[j].strip():
+                    j += 1
+            i = j
+            continue
         if i in replacements:
             end, gfm = replacements[i]
             out.extend(gfm)
@@ -1663,8 +3185,23 @@ def _apply_grid_tables(pdf_path, page: int, body_md):
         else:
             out.append(lines[i])
             i += 1
+    if len(lines) in insertions:
+        for _blk in insertions[len(lines)]:
+            if out and out[-1].strip():
+                out.append("")
+            out.extend(_blk)
     print(f"    [GRID] p{page}: find_tables 로 표 {sum(matched)}개 반영(F11)", flush=True)
-    return "\n".join(out)
+    result = _bind_wide_table_captions(pdf_path, page, "\n".join(out), grids_info)
+    # (b)(c) 페이지걸침표 캡션 dedup + 3.2.x 헤딩 재배치(P1 위 후처리, 게이트 미충족 시 무동작).
+    result = _straddle_caption_dedup(pdf_path, page, result, grids_info)
+    # F-CAPTION-DET: 벡터텍스트 미실재/오귀속 캡션 결정론 제거((b)(c) 뒤 멱등 적용).
+    # (R5: 페이지 걸침 귀속·순서·캡션 복원은 doc 레벨 _xpage_registry_pass 가 일원 담당.)
+    result = _apply_caption_det(pdf_path, page, result, grids_info)
+    # F-DOCLING(R6): R5 HTML→GFM 교체(지문 일치 grid 전제)가 못 잡은 잔존 raw HTML 표
+    #   를 Docling 폴백으로 교체. env FMDW_TABLE_FALLBACK 미설정 시 완전 무동작.
+    if "<table" in result:
+        result = _docling_replace_html_spans(pdf_path, page, result)
+    return result
 
 
 # ── F12: 결정론적 runaway/truncation 정리(FMDW_DERUNAWAY, 기본 ON) — 2026-07-09 ────
@@ -2992,6 +4529,78 @@ FIGURE_RULES = (
 def setup_dirs():
     TEMP_PDF_DIR.mkdir(parents=True, exist_ok=True)
 
+
+# ── R9 안정성 라운드(2026-07-15): 공통 subprocess 타임아웃 래퍼 + 원자적 쓰기 ────
+# F2(QA C1/M2): soffice·uvx·Chrome headless 등 외부 subprocess 가 무기한 행업하면
+#   (변형 입력·stale .~lock·모달 대기 등 알려진 실패 모드) 배치 전체가 영구 정지한다
+#   → 타임아웃(기본 env FMDW_SUBPROC_TIMEOUT=600초) + 프로세스 그룹 SIGKILL 후
+#   TimeoutExpired 재전파. 호출부의 기존 except 가 '해당 파일 실패'로 처리하므로
+#   배치는 다음 파일로 계속된다(전체 중단 금지).
+# F3(QA M3): write_text 직접 쓰기는 도중 OOM-kill/SIGKILL/정전 시 잘린 바이트만
+#   남고, 스킵 가드(MISSING/TRUNCATED 마커 검사)는 마커가 삽입될 기회조차 없어
+#   불완전본을 '완성본'으로 오인·스킵한다 → 동일 디렉토리 tmp 기록 후 os.replace
+#   원자 치환(_atomic_write). 실패 시 기존 파일 무손상.
+
+def _subproc_timeout() -> int:
+    try:
+        return int(os.getenv("FMDW_SUBPROC_TIMEOUT", "600"))
+    except ValueError:
+        return 600
+
+
+def _run_subproc(cmd, timeout=None, check=False, capture_output=False):
+    """subprocess.run 대체(R9 F2) — timeout + 프로세스 그룹 kill.
+
+    TimeoutExpired 시 자식 프로세스 그룹 전체(start_new_session 으로 격리된
+    pgid == pid)를 SIGKILL 하고 예외를 다시 던진다(호출부 파일 단위 실패 처리).
+    반환은 subprocess.CompletedProcess (기존 run() 계약 호환)."""
+    import signal
+
+    if timeout is None:
+        timeout = _subproc_timeout()
+    popen_kw = {"start_new_session": True}
+    if capture_output:
+        popen_kw["stdout"] = subprocess.PIPE
+        popen_kw["stderr"] = subprocess.PIPE
+    proc = subprocess.Popen(cmd, **popen_kw)
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)  # start_new_session → pgid == pid
+        except (ProcessLookupError, PermissionError, OSError):
+            proc.kill()
+        try:
+            proc.communicate(timeout=10)  # 좀비 회수
+        except Exception:  # noqa: BLE001 — 회수 실패는 비차단
+            pass
+        print(f"[!] subprocess timeout({timeout}s) → killed: {cmd[0]}", flush=True)
+        raise
+    cp = subprocess.CompletedProcess(cmd, proc.returncode, out, err)
+    if check and proc.returncode != 0:
+        raise subprocess.CalledProcessError(proc.returncode, cmd,
+                                            output=out, stderr=err)
+    return cp
+
+
+def _atomic_write(path, data: str) -> None:
+    """동일 디렉토리 tmp 파일 기록 → os.replace 원자 치환(R9 F3).
+
+    쓰기 도중 프로세스가 죽어도 기존 파일은 무손상(잘린 파일이 완성본으로
+    남지 않음). 동일 파일시스템 내 replace 라 원자성 보장."""
+    p = Path(path)
+    tmp = p.with_name(p.name + f".tmp.{os.getpid()}")
+    try:
+        tmp.write_text(data, encoding="utf-8")
+        os.replace(tmp, p)
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+
 def convert_to_pdf(input_path):
     """Converts various formats to PDF using LibreOffice."""
     print(f"[*] Converting {input_path.name} to PDF...", flush=True)
@@ -3000,7 +4609,7 @@ def convert_to_pdf(input_path):
             "soffice", "--headless", "--convert-to", "pdf", 
             "--outdir", str(TEMP_PDF_DIR), str(input_path)
         ]
-        subprocess.run(cmd, check=True, capture_output=True)
+        _run_subproc(cmd, check=True, capture_output=True)  # R9 F2: 무기한 행업 방지
         pdf_path = TEMP_PDF_DIR / input_path.with_suffix(".pdf").name
         return pdf_path if pdf_path.exists() else None
     except Exception as e:
@@ -3544,7 +5153,7 @@ def hwp_to_pdf(hwp_path):
             "uvx", "--with", "six", "--with", "lxml", "--from", "pyhwp",
             "hwp5html", "--output", str(html_out), str(hwp_path)
         ]
-        subprocess.run(cmd_html, check=True, capture_output=True)
+        _run_subproc(cmd_html, check=True, capture_output=True)  # R9 F2: uvx 행업 방지
 
         # Find index file
         html_file = next(html_out.glob("index.xhtml"), next(html_out.glob("index.html"), None))
@@ -3559,7 +5168,7 @@ def hwp_to_pdf(hwp_path):
             chrome_path, "--headless", "--disable-gpu",
             f"--print-to-pdf={pdf_path}", f"file://{html_file.absolute()}"
         ]
-        subprocess.run(cmd_pdf, check=True, capture_output=True)
+        _run_subproc(cmd_pdf, check=True, capture_output=True)  # R9 F2: Chrome 행업 방지
 
         return pdf_path if pdf_path.exists() else None
     except Exception as e:
@@ -4048,8 +5657,25 @@ def _apply_heading(lines, i):
     return None
 
 
+# S-R7(2026-07-14): 점 번호 헤딩 레벨 결정론 정규화. glm 이 런마다 'N.N.N' 절 헤딩의
+# 레벨을 다르게 내는 비결정 편차(regress7 '## 3.2.2' vs regress6 '### 3.2.2' 실측) 고정.
+# 사용자 표준(fmdw.md): 장 `# N` / 절 `## N.N` / 소절 `### N.N.N` → 레벨 = 점 세그먼트
+# 수(상한 4). 점 없는 맨숫자 헤딩(`# 1`)은 불변(오탐 위험 — 기존 정책 유지). 번호-제목
+# 사이 공백런도 1개로 정규화. FMDW_MD_STYLE=0 이면 기존처럼 전체 비활성.
+_MD_STYLE_NUMHEAD_RE = re.compile(r"^(#{1,6})\s+(\d+(?:\.\d+)+)\.?\s+(\S.*)$")
+
+
+def _relevel_numbered_heading(l: str):
+    m = _MD_STYLE_NUMHEAD_RE.match(l)
+    if not m:
+        return None
+    level = min(len(m.group(2).split(".")), 4)
+    return "#" * level + " " + m.group(2) + " " + m.group(3).strip()
+
+
 def _style_lines(lines) -> str:
-    """비-목차 블록에 S1/S2 적용. 코드펜스·표 행·기존 헤딩은 무변경."""
+    """비-목차 블록에 S1/S2 적용. 코드펜스·표 행·기존 헤딩은 무변경(단, S-R7 점 번호
+    헤딩 레벨 정규화만 예외 — 결정론 재레벨)."""
     res = []
     in_fence = False
     for i, l in enumerate(lines):
@@ -4059,6 +5685,10 @@ def _style_lines(lines) -> str:
             continue
         if in_fence or l.strip().startswith("|"):
             res.append(l)
+            continue
+        nl = _relevel_numbered_heading(l)   # S-R7: 점 번호 헤딩 레벨 고정
+        if nl is not None:
+            res.append(nl)
             continue
         nl = _apply_caption_bold(l)
         if nl is not None:
@@ -4741,6 +6371,12 @@ def _promote_bold_subheadings(md: str, bold_labels: dict) -> str:
                 or re.match(r"^([-*+]\s|\d+\.\s)", s)):
             out.append(l)
             continue
+        # R5 캡션 보호(D3, FMDW_XPAGE_CONT 게이트): 'Table/Figure N:' 캡션 라인은 PDF
+        # 에서 본문 크기 볼드라 bold_labels 에 수집되지만 소제목이 아니라 표 캡션이다.
+        # ### 승격 시 CONTCAP/원장 캡션 인식이 깨져 continued 체인이 전멸(p23~27 사고).
+        if _xpage_cont_enabled() and _XPAGE_CAPLINE_RE.match(s):
+            out.append(l)
+            continue
         if _norm_label(s) not in bold_labels:
             out.append(l)
             continue
@@ -5259,13 +6895,22 @@ def _cc_first_table_top(body: list):
 
 
 def _cc_caption_above(body: list, start: int, rx):
-    """표/도면 시작 바로 위 최근접 비-skip 라인이 캡션이면 (num, title). 아니면 None."""
+    """표/도면 시작 바로 위 최근접 비-skip 라인이 캡션이면 (num, title). 아니면 None.
+
+    F-XPAGE(R4', 2026-07-14): glm 이 캡션을 헤딩형('### Table 8: ...')으로 전사하는
+    런 변이가 있어(볼드형과 무작위 교차), FMDW_XPAGE_CONT ON 일 때는 선두 #{1,6} 를
+    벗겨 재매칭 — 표 직상단의 'Table/Figure N:' 라인은 형식과 무관하게 캡션이다.
+    OFF 면 기존 동작(볼드/평문형만) 바이트 동일."""
     k = start - 1
     while k >= 0 and _cc_is_skip(body[k].strip()):
         k -= 1
     if k < 0:
         return None
     m = rx.match(body[k])
+    if not m and _xpage_cont_enabled():
+        stripped = re.sub(r"^\s*#{1,6}\s*", "", body[k])
+        if stripped != body[k]:
+            m = rx.match(stripped)
     if not m:
         return None
     title = _cc_strip_continued(m.group(2).strip().rstrip("*").strip())
@@ -5307,15 +6952,23 @@ def _cc_first_image_top(body: list):
     return k if _CONTCAP_IMG_RE.match(body[k]) else None
 
 
-def _apply_caption_continuation(md: str) -> str:
-    """페이지/청크 걸침 표·도면에 '(continued)' 캡션(+표 헤더 반복)을 삽입. gate OFF 시 무변경."""
+def _apply_caption_continuation(md: str, pdf_path=None) -> str:
+    """페이지/청크 걸침 표·도면에 '(continued)' 캡션(+표 헤더 반복)을 삽입. gate OFF 시 무변경.
+
+    R5(2026-07-14): pdf_path 제공 + FMDW_XPAGE_CONT ON 이면 '표' continued 는
+    _xpage_registry_pass(헤더 지문 전용 바인딩)가 단일 권위 — 이 함수의 표 루프는
+    건너뛰고 도면(Figure) 이어짐만 처리한다. OFF/pdf 미제공 = 기존 동작 그대로."""
     if not md or not _caption_continuation_enabled():
         return md
     segments = _cc_segment(md)
     changed = False
 
     # ── 표 이어짐 ──
-    for i in range(len(segments) - 1):
+    # R5(2026-07-14): FMDW_XPAGE_CONT ON + pdf_path 제공 시 표 continued 는
+    # _xpage_registry_pass(지문 전용 바인딩)가 단일 권위 — 여기 최근성(recency) 기반
+    # 표 루프는 건너뛴다(오귀속 D1 재발 방지). OFF 또는 pdf 미제공 = 기존 동작 그대로.
+    _skip_tbl = pdf_path is not None and _xpage_cont_enabled()
+    for i in (range(0) if _skip_tbl else range(len(segments) - 1)):
         pg_a, body_a = segments[i][1], segments[i][2]
         pg_b, body_b = segments[i + 1][1], segments[i + 1][2]
         if pg_a is None or pg_b is None or pg_b != pg_a + 1:
@@ -5462,6 +7115,189 @@ def apply_md_style(md: str) -> str:
     return "\n\n---\n\n".join(out)
 
 
+# ── F-HTML-FLAG / F-LOWMODEL-FLAG(2026-07-13) — 결정론 QA 플래깅 ────────────────
+#     설계: 05_Leolsi/03_DOC/design/fmdw-pipeline-improvement-caption-grid-260713.md §2.
+#     F-HTML-FLAG: 산출 MD 의 금지된 raw HTML 표(`<table` / `class="table`)를 스캔해
+#       위반 라인 직전에 `<!-- fmdw:html-table-violation pXX -->` 마커 삽입 + WARN 로그
+#       + <stem>_qa.json 위반 레코드. 코드펜스 내부 제외(오탐 방지). 페이지 번호는
+#       선행 `<!-- page N -->` 마커에서 결정론 유도(불명 = p?). 값 수정 없음(가시화만).
+#     F-LOWMODEL-FLAG: 실사용 모델 기록(ox.MODELS_USED — 성공 응답에만 add)이 전부
+#       소형(< FMDW_LOWMODEL_MIN_B, 기본 30B 미만 또는 규모 불명) 로컬 모델이면
+#       _qa.json 에 저신뢰 레코드 → QA 오케스트레이터의 사람 비전 검증 우선순위 신호.
+#     사이드카는 기존 <stem>_figures.json 스키마를 오염시키지 않도록 별도 파일
+#     <stem>_qa.json 로 신설(다운스트림 소비자 호환성 유지).
+_HTML_TABLE_RE = re.compile(r"<table\b|class=\"table", re.IGNORECASE)
+_QA_PAGE_MARKER_RE = re.compile(r"<!--\s*page\s+(\d+)", re.IGNORECASE)
+
+
+def _html_flag_enabled() -> bool:
+    """F-HTML-FLAG 토글. 0/false/off/no 면 무동작(기존 동작 바이트 동일)."""
+    return os.getenv("FMDW_HTML_FLAG", "1").strip().lower() not in (
+        "0", "false", "off", "no")
+
+
+# ── R10 D-2(2026-07-15): 페이지 경계 코드펜스 불균형 결정론 교정 ────────────────
+def _fence_balance_enabled() -> bool:
+    """D-2 토글. 0/false/off/no 면 무동작(기존 동작 바이트 동일)."""
+    return os.getenv("FMDW_FENCE_BALANCE", "1").strip().lower() not in (
+        "0", "false", "off", "no")
+
+
+_FENCE_LINE_RE = re.compile(r"^\s*(```|~~~)")
+_FENCE_PAGE_MARK_RE = re.compile(r"<!-- page (\d+) -->")
+
+
+def _balance_page_fences(md):
+    """페이지 세그먼트별 코드펜스 열림-닫힘 불균형을 결정론 교정(내용 창작 0).
+
+    빈/희소 페이지에서 모델이 여는 펜스(```markdown 등)만 출력하고 닫지 않으면
+    이후 문서 전체가 코드블록으로 렌더된다(qa_matrix 09_edge_blank 실측: p2 본문이
+    '```markdown' 단독 잔존). 페이지 마커로 나눈 세그먼트의 펜스 라인 수가 '홀수'일
+    때만 개입:
+      - 세그먼트 마지막 펜스 뒤에 실내용(비공백, '---' 구분선 제외)이 없으면
+        → 그 '빈 여는 펜스' 라인을 제거(고아 펜스).
+      - 실내용이 있으면 → 마지막 실내용 라인 뒤에 닫는 펜스를 추가(내용 무변경).
+    균형 세그먼트는 무접촉(회귀 0). FMDW_FENCE_BALANCE=0 비활성.
+    """
+    if not md or not _fence_balance_enabled():
+        return md
+    lines = md.split("\n")
+    marks = [i for i, l in enumerate(lines) if _FENCE_PAGE_MARK_RE.search(l)]
+    if not marks:
+        return md
+    remove_idx: set = set()
+    insert_close_after: dict = {}
+    bounds = marks + [len(lines)]
+    for mi in range(len(marks)):
+        s, e = marks[mi] + 1, bounds[mi + 1]
+        fence_idx = [i for i in range(s, e) if _FENCE_LINE_RE.match(lines[i])]
+        if len(fence_idx) % 2 == 0:
+            continue
+        page_no = _FENCE_PAGE_MARK_RE.search(lines[marks[mi]]).group(1)
+        last = fence_idx[-1]
+        tail_content = any(
+            lines[i].strip() and lines[i].strip() != "---"
+            for i in range(last + 1, e))
+        if not tail_content:
+            remove_idx.add(last)
+            print(f"    [FENCE] p{page_no}: 빈 여는 코드펜스 제거(불균형 교정)",
+                  flush=True)
+        else:
+            j = e - 1
+            while j > last and (not lines[j].strip()
+                                or lines[j].strip() == "---"):
+                j -= 1
+            insert_close_after[j] = lines[last].lstrip()[:3]  # ``` 또는 ~~~
+            print(f"    [FENCE] p{page_no}: 미닫힘 코드펜스 닫음(불균형 교정)",
+                  flush=True)
+    if not remove_idx and not insert_close_after:
+        return md
+    out = []
+    for i, l in enumerate(lines):
+        if i in remove_idx:
+            continue
+        out.append(l)
+        if i in insert_close_after:
+            out.append(insert_close_after[i])
+    return "\n".join(out)
+
+
+def _flag_html_tables(md: str):
+    """(마커 삽입된 md, 위반 레코드 리스트). OFF/무위반 = (md 불변, [])."""
+    if not _html_flag_enabled() or not md:
+        return md, []
+    lines = md.split("\n")
+    out, viol = [], []
+    in_fence = False
+    cur_page = None
+    for l in lines:
+        if _MD_STYLE_FENCE_RE.match(l):
+            in_fence = not in_fence
+            out.append(l)
+            continue
+        pm = _QA_PAGE_MARKER_RE.search(l)
+        if pm:
+            cur_page = int(pm.group(1))
+        if not in_fence and _HTML_TABLE_RE.search(l):
+            ptag = f"p{cur_page}" if cur_page is not None else "p?"
+            marker = f"<!-- fmdw:html-table-violation {ptag} -->"
+            if not (out and out[-1].strip() == marker):
+                out.append(marker)
+            viol.append({"page": cur_page, "excerpt": l.strip()[:120]})
+            print(f"    [!] WARN: html table at {ptag}", flush=True)
+        out.append(l)
+    return "\n".join(out), viol
+
+
+def _model_params_b(name: str):
+    """모델명에서 파라미터 규모(단위 B)를 파싱. 'qwen3-vl:8b-instruct-q8_0' → 8.0.
+
+    규모 표기가 없으면 None(불명 — 보수적으로 소형 취급 → 사람 QA 쪽으로 편향)."""
+    vals = re.findall(r"(\d+(?:\.\d+)?)b", name.lower())
+    return max((float(v) for v in vals), default=None)
+
+
+def _lowmodel_flag_enabled() -> bool:
+    """F-LOWMODEL-FLAG 토글(Advisor R2). 0/false/off/no 면 판정·기록 경로 완전 스킵."""
+    return os.getenv("FMDW_LOWMODEL_FLAG", "1").strip().lower() not in (
+        "0", "false", "off", "no")
+
+
+def _low_model_flag(models):
+    """F-LOWMODEL-FLAG 판정 — 실행 중 실사용 모델 기록 기반(하드코딩 금지).
+
+    대형(≥ FMDW_LOWMODEL_MIN_B, 기본 30B) 모델이 1개라도 실사용됐으면 None(비저신뢰).
+    전부 소형/불명이면 저신뢰 레코드 dict. 게이트 OFF 면 항상 None."""
+    if not _lowmodel_flag_enabled() or not models:
+        return None
+    try:
+        min_b = float(os.getenv("FMDW_LOWMODEL_MIN_B", "30"))
+    except ValueError:
+        min_b = 30.0
+    if any((_model_params_b(m) or 0.0) >= min_b for m in models):
+        return None
+    return {
+        "low_confidence_model": ",".join(sorted(models)),
+        "requires_human_vision_qa": True,
+        "reason": "offline_lockdown_no_large_vision",
+    }
+
+
+def _write_qa_sidecar(output_dir, stem: str, models_used, html_violations,
+                      xpage_notes=None):
+    """<stem>_qa.json 기록(F-HTML-FLAG + F-LOWMODEL-FLAG + R5 원장 노트). 대상 없으면 미생성."""
+    low = _low_model_flag(models_used)
+    if not html_violations and not low and not xpage_notes \
+            and not DOCLING_FALLBACK_USED:
+        return
+    rec = {
+        "source_file": stem,
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "provider": ox.provider_label(),
+        "models_used": list(models_used),
+        "html_table_violations": html_violations,
+    }
+    if xpage_notes:
+        rec["xpage_registry_notes"] = list(xpage_notes)   # 사람 검수 플래그(R5)
+    if DOCLING_FALLBACK_USED:                             # provenance(R6)
+        rec["table_fallback"] = {
+            "engine": "docling", "mode": "ACCURATE",
+            "tables": list(DOCLING_FALLBACK_USED)}
+    if low:
+        rec.update(low)
+        print(f"    [QA] 저신뢰 소형모델-only 변환: {low['low_confidence_model']} "
+              f"→ requires_human_vision_qa", flush=True)
+    try:
+        import json
+
+        p = Path(output_dir) / f"{stem}_qa.json"
+        p.write_text(json.dumps(rec, ensure_ascii=False, indent=2) + "\n",
+                     encoding="utf-8")
+        print(f"[+] QA 사이드카: {p}", flush=True)
+    except Exception as e:  # noqa: BLE001 — QA 기록 실패가 변환을 깨지 않게
+        print(f"[~] _qa.json 기록 실패(무시): {e}", flush=True)
+
+
 def process_file(input_path, output_dir_base):
     output_dir = Path(f"output/{output_dir_base}")
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -5485,6 +7321,13 @@ def process_file(input_path, output_dir_base):
               flush=True)
 
     print(f"[*] Provider for {input_path.name}: {ox.provider_label()}", flush=True)
+    # F-LOWMODEL-FLAG(Advisor R2, 2026-07-13): 파일 단위 집계 = 시작 시 레지스트리
+    # 초기화 + 종료 시 전체 사용. (구 스냅샷-차집합은 멀티파일 순차 변환에서 file2 가
+    # file1 과 동일 모델 재사용 시 diff=∅ → 저신뢰 플래그 false-negative — 폐기.)
+    # clear 안전 근거: 소비자는 _write_qa_sidecar 단독, main() 순차 루프, 스레드 없음.
+    getattr(ox, "MODELS_USED", set()).clear()
+    XPAGE_QA_NOTES.clear()   # R5: 원장 사람검수 노트 — 파일 단위 집계
+    DOCLING_FALLBACK_USED.clear()   # R6: Docling 폴백 provenance — 파일 단위 집계
 
     # 0. Handle Images directly
     if input_path.suffix.lower() in [".png", ".jpg", ".jpeg"]:
@@ -5512,6 +7355,13 @@ def process_file(input_path, output_dir_base):
         except Exception as _he:
             print(f"[!] hybrid_convert 실패 ({input_path.name}): {_he} → PDF 경로로 폴백", flush=True)
         else:
+            # R9 F4(QA M1): hybrid 성공 → stale .partial.md 제거(PDF 성공 분기와
+            # 대칭). 남겨두면 스킵 가드의 partial 존재 조건이 영구 True → 완성본이
+            # 있는데도 매 실행 재변환 + vision 재호출이 무한 반복된다.
+            if partial_output_path.exists():
+                partial_output_path.unlink()
+                print(f"[*] Removed .partial.md (now complete): {partial_output_path}",
+                      flush=True)
             return  # 성공 시 PDF 경로 불필요
 
     # 1. Convert to PDF (unless it's already a PDF)
@@ -5608,6 +7458,7 @@ def process_file(input_path, output_dir_base):
                   flush=True)
 
     # 3. Save and Cleanup
+    _html_viol = []   # F-HTML-FLAG 위반 레코드(_qa.json 용) — 빈 변환이어도 정의 보장.
     if chunk_texts:
         combined = "\n\n---\n\n".join(chunk_texts)
         # M-3: 결합 직후 Figure 헤딩을 문서 전역 1..K 로 리넘버(청크/페이지마다
@@ -5653,13 +7504,25 @@ def process_file(input_path, output_dir_base):
         # CONTCAP(2026-07-12): 페이지/청크 걸침 표·도면에 '(continued)' 캡션+헤더 반복 삽입
         #   (RAG 파편 소속 명시). 최종 표/캡션 형태가 확정된 마지막 콘텐츠 후처리로 배치.
         #   FMDW_CAPTION_CONTINUATION=0 비활성(회귀 0). 페이지 마커·표 행만 사용(결정론).
-        combined = _apply_caption_continuation(combined)
+        # R5(2026-07-14): 표 정체성 원장 후처리 — 캡션 복원(벡터 증거)·지문 전용 continued·
+        #   캡션 헤딩화 정정·블록 y-순서 정규화·빈 표 파편 가드. FMDW_XPAGE_CONT=0 무동작.
+        combined = _xpage_registry_pass(combined, pdf_path)
+        # CONTCAP: XPAGE ON 이면 표 continued 는 위 원장이 단일 권위(표 루프 skip),
+        #   도면(Figure) 이어짐만 여기서. OFF = 기존 동작 그대로.
+        combined = _apply_caption_continuation(combined, pdf_path)
+        # R10 D-2(2026-07-15): 페이지 경계 미닫힘 코드펜스 결정론 교정 — 빈/희소
+        #   페이지에서 모델이 여는 펜스만 남기면 이후 문서 전체가 코드블록으로
+        #   렌더된다(qa_matrix 09_edge_blank 실측). 균형 페이지 무접촉(회귀 0).
+        combined = _balance_page_fences(combined)
+        # F-HTML-FLAG(2026-07-13): 금지된 raw HTML 표 결정론 스캔 — 위반 직전 마커 삽입
+        #   + WARN 로그 + _qa.json 레코드(아래). 내용 수정 없음(가시화만).
+        combined, _html_viol = _flag_html_tables(combined)
         has_failures = bool(failed_chunks)
 
         # H-5: 실패 청크가 있으면 .partial.md 로 저장 — 완성본으로 위장하지 않는다.
         #       완전 성공 시에는 .md 로 저장하고 기존 .partial.md 가 있으면 제거.
         if has_failures:
-            partial_output_path.write_text(combined, encoding="utf-8")
+            _atomic_write(partial_output_path, combined)  # R9 F3: 원자 치환
             print(f"[!] Partial MD saved (some chunks failed): {partial_output_path}",
                   flush=True)
             # 이전에 생성된 완성본 .md 가 있으면 제거 (부분본이 최신)
@@ -5667,7 +7530,7 @@ def process_file(input_path, output_dir_base):
                 final_output_path.unlink()
                 print(f"[*] Removed stale complete .md: {final_output_path}", flush=True)
         else:
-            final_output_path.write_text(combined, encoding="utf-8")
+            _atomic_write(final_output_path, combined)  # R9 F3: 원자 치환
             print(f"[+] Final MD saved: {final_output_path}", flush=True)
             # 성공적으로 완성 → 기존 .partial.md 제거
             if partial_output_path.exists():
@@ -5686,6 +7549,13 @@ def process_file(input_path, output_dir_base):
         target_md = partial_output_path if partial_output_path.exists() else final_output_path
         if target_md.exists():
             inject_figure_refs_into_md(target_md, figs, output_dir, pdf_path)
+
+    # F-HTML-FLAG/F-LOWMODEL-FLAG(2026-07-13): <stem>_qa.json 사이드카 기록.
+    #   기존 <stem>_figures.json 스키마 불변(별도 파일). 기록 대상 없으면 미생성.
+    _write_qa_sidecar(
+        output_dir, input_path.stem,
+        sorted(getattr(ox, "MODELS_USED", set())),
+        _html_viol, xpage_notes=XPAGE_QA_NOTES)
 
     # Only delete if we converted it
     if input_path.suffix.lower() in [".docx", ".pptx", ".xlsx", ".hwp", ".hwpx"] and pdf_path.exists():
@@ -5721,6 +7591,25 @@ def _unload_all_llms_at_exit():
 
 
 def main():
+    # R10 CLI 위생(2026-07-15): argparse 도입 — `--help` 는 변환 시작 전 즉시 출력·종료
+    # (언로드 불필요·모델 미접촉). 이 스크립트의 모든 설정은 env 가 SSoT(EXTRACT_*/
+    # FMDW_*)라 정의된 인자는 없다. 미지 인자는 경고 후 무시(완전 하위호환 —
+    # goose_convert_one.sh 는 import 경로라 main() 미경유, convert_project.run_fmdw
+    # 는 무인자 호출: 두 호출부 모두 무변경).
+    import argparse
+
+    ap = argparse.ArgumentParser(
+        prog="extract_all_via_pdf.py",
+        description="fmdw 문서→Markdown 변환기 — input/<type>/ 배치 전체를 "
+                    "output/<type>_md/ 로 변환한다. 모든 설정은 환경변수로 전달"
+                    "(인자 없음).",
+        epilog="주요 env: EXTRACT_PROVIDER, EXTRACT_FIGURES, EXTRACT_CHUNK_SIZE, "
+               "EXTRACT_RENDER_DPI, EXTRACT_DOMAIN, FMDW_BODY_HYBRID, "
+               "FMDW_SUBPROC_TIMEOUT, FMDW_FENCE_BALANCE, FMDW_NO_UNLOAD 등 "
+               "(표준 조합은 convert_md.sh / goose_convert_one.sh 참조).")
+    _ns, _unknown = ap.parse_known_args()
+    if _unknown:
+        print(f"[~] 알 수 없는 인자 무시(하위호환): {_unknown}", flush=True)
     # 종료 시 로컬 LLM 전원 언로드 보장(정상 종료·예외·KeyboardInterrupt 모두 finally).
     try:
         _main_convert()

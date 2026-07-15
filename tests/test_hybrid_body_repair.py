@@ -193,15 +193,19 @@ def test_glm_empty_and_qwen_fallback_fails_emits_missing_marker():
 
 
 def test_oversized_page_calls_neither_model():
-    """오버사이즈 표 페이지는 placeholder 로 처리되어 primary/fallback 모두 호출 안 됨."""
+    """오버사이즈 표 페이지는 placeholder 로 처리되어 primary/fallback 모두 호출 안 됨.
+
+    R10 #7 갱신(2026-07-15): CHANGE 4(2026-07-08 '추출 이미지 섹션 표기 최소화')로
+    본문 placeholder 안내문('📊 초대형 표...')은 제거됐다 — 현 계약 = 페이지 마커만
+    남긴다(표 내용은 별도 크롭 + 문서 끝 추출 이미지 블록). 구 기대값('초대형 표'
+    문구 존재)은 stale 이라 현 사양으로 교체."""
     with patch.object(eap.ox, "extract_pdf_pages") as mo, \
          patch.object(eap, "_pdf_page_text_len") as mt:
         result = eap._oversized_placeholder(13)
 
     mo.assert_not_called()
     mt.assert_not_called()
-    assert "13" in result
-    assert "초대형 표" in result
+    assert result == "<!-- page 13 -->\n"   # 페이지 마커만(안내문 0 — 표기 최소화)
 
 
 def test_build_transcription_prompt_uses_given_range():
@@ -215,7 +219,11 @@ def test_build_transcription_prompt_uses_given_range():
 
 def test_hybrid_extract_range_single_page_delegates():
     """단일 페이지 범위(start==end)는 자신의 프롬프트(_build_transcription_prompt(1,1))로
-    _hybrid_transcribe_page 를 호출하고 그 결과를 그대로 반환한다."""
+    _hybrid_transcribe_page 를 호출하고 그 결과를 반환한다.
+
+    R10 #7 갱신(2026-07-15): Fix 3(2026-07-04)이후 페이지 마커는 코드가 결정적으로
+    선두에 부착한다(_prepend_page_marker — 모델 지시 의존 제거, R5 감사 마커 표준).
+    구 기대값(마커 없는 원문 그대로)은 stale 이라 현 계약으로 교체."""
     with patch.object(eap, "_build_transcription_prompt",
                        return_value="PAGE1-PROMPT") as mbp, \
          patch.object(eap, "_hybrid_transcribe_page",
@@ -224,7 +232,8 @@ def test_hybrid_extract_range_single_page_delegates():
 
     mbp.assert_called_once_with(1, 1)
     mp.assert_called_once_with("/fake.pdf", 1, "PAGE1-PROMPT")
-    assert result == "PAGE1 MD"
+    # 페이지 마커 결정적 부착(현 계약) + 본문 보존
+    assert result == "<!-- page 1 -->\n\nPAGE1 MD"
 
 
 def test_hybrid_extract_range_partial_failure_marks_missing():
