@@ -640,40 +640,60 @@ class TestAutoPathMissingMarker(unittest.TestCase):
 # ──────────────────────────────────────────────────────────────────────────────
 
 class TestResolveProvider(unittest.TestCase):
-    """_resolve_provider — 함수 인자 우선, None 이면 EXTRACT_PROVIDER 기본값."""
+    """_resolve_provider — 함수 인자 우선, None 이면 EXTRACT_PROVIDER 기본값.
+
+    R11(2026-07-15) 기대값 갱신: 하드 로컬 가드(2026-06-30, 사용자 명시 지시)로
+    'gemini'(외부 cloud)는 인자/모듈 기본값 어느 경로로 와도 'ollama_cloud'
+    (localhost)로 흡수된다. 구 기대값('gemini' 그대로 통과)은 가드 이전 사양.
+    검증 의도(인자 우선 + strip/lower 정규화)는 흡수 계약 위에서 그대로 유지.
+    """
 
     def test_none_uses_module_default(self):
-        """provider=None → 모듈 기본값 EXTRACT_PROVIDER 사용 (기존 동작 보존)."""
+        """provider=None → 모듈 기본값 사용. gemini 기본값은 로컬로 흡수."""
         with patch.object(ox, "EXTRACT_PROVIDER", "ollama_cloud"):
             self.assertEqual(ox._resolve_provider(None), "ollama_cloud")
         with patch.object(ox, "EXTRACT_PROVIDER", "gemini"):
-            self.assertEqual(ox._resolve_provider(None), "gemini")
+            # R11: 하드 로컬 가드 — 모듈 기본값이 gemini 여도 로컬로 흡수.
+            self.assertEqual(ox._resolve_provider(None), "ollama_cloud")
 
     def test_explicit_arg_overrides_module_default(self):
-        """명시 인자가 모듈 기본값을 override (이번 호출 한정)."""
+        """명시 인자가 모듈 기본값을 override (이번 호출 한정).
+
+        R11: 인자 우선 순위는 '미지 provider 인자 passthrough'로 검증(가드 흡수와
+        독립적으로 인자가 모듈 기본값을 이기는 것을 관찰 가능). gemini 인자는 흡수."""
         with patch.object(ox, "EXTRACT_PROVIDER", "ollama_cloud"):
-            self.assertEqual(ox._resolve_provider("gemini"), "gemini")
+            # gemini 인자 → 하드 로컬 가드 흡수(외부 cloud 원천 차단).
+            self.assertEqual(ox._resolve_provider("gemini"), "ollama_cloud")
         with patch.object(ox, "EXTRACT_PROVIDER", "gemini"):
             self.assertEqual(ox._resolve_provider("ollama_cloud"), "ollama_cloud")
+        with patch.object(ox, "EXTRACT_PROVIDER", "ollama_cloud"):
+            # 인자 우선 관찰: 미지 provider 는 정규화 후 그대로 반환(경고 1회).
+            self.assertEqual(ox._resolve_provider("custom_x"), "custom_x")
 
     def test_arg_normalized_strip_lower(self):
-        """인자도 EXTRACT_PROVIDER 정규화 규칙(strip+lower)과 일치."""
-        self.assertEqual(ox._resolve_provider("  GEMINI  "), "gemini")
+        """인자도 EXTRACT_PROVIDER 정규화 규칙(strip+lower)과 일치.
+
+        R11: '  GEMINI  ' 가 ollama_cloud 로 흡수되는 것 자체가 strip+lower 정규화가
+        가드보다 먼저 적용됨을 증명한다(정규화 안 되면 'gemini' 분기 미매칭)."""
+        self.assertEqual(ox._resolve_provider("  GEMINI  "), "ollama_cloud")
         self.assertEqual(ox._resolve_provider("Ollama_Cloud"), "ollama_cloud")
 
 
 class TestProviderOverrideRouting(unittest.TestCase):
     """공개 추출 함수가 provider 인자로 호출 단위 경로를 전환하는지 검증."""
 
-    def test_extract_pdf_pages_override_to_gemini(self):
-        """모듈 기본 ollama_cloud 라도 provider='gemini' 면 gemini 경로 호출."""
+    def test_extract_pdf_pages_gemini_absorbed_to_local(self):
+        """R11 갱신: provider='gemini' 는 하드 로컬 가드(2026-06-30)로 로컬 경로에
+        흡수된다 — _gemini_pdf_pages 는 절대 호출되지 않고 ollama 경로로 처리.
+        (구 기대값 'gemini 경로 호출'은 가드 이전 사양 — 외부 cloud 차단이 현 계약.)"""
         with patch.object(ox, "EXTRACT_PROVIDER", "ollama_cloud"), \
-             patch.object(ox, "_gemini_pdf_pages", return_value="GEMINI_MD") as mg, \
-             patch.object(ox, "_ollama_vision") as mo:
+             patch.object(ox, "_gemini_pdf_pages") as mg, \
+             patch.object(ox, "render_pdf_pages_to_base64", return_value=["b64"]), \
+             patch.object(ox, "_ollama_vision", return_value="OLLAMA_MD") as mo:
             result = ox.extract_pdf_pages("p", Path("/x.pdf"), 1, 1, provider="gemini")
-            self.assertEqual(result, "GEMINI_MD")
-            mg.assert_called_once()
-            mo.assert_not_called()
+            self.assertEqual(result, "OLLAMA_MD")
+            mo.assert_called_once()
+            mg.assert_not_called()
 
     def test_extract_pdf_pages_override_to_ollama(self):
         """모듈 기본 gemini 라도 provider='ollama_cloud' 면 ollama 경로 호출."""
@@ -697,15 +717,17 @@ class TestProviderOverrideRouting(unittest.TestCase):
             mo.assert_called_once()
             mg.assert_not_called()
 
-    def test_extract_image_override_to_gemini(self):
-        """extract_image provider override 가 gemini 경로로 라우팅."""
+    def test_extract_image_gemini_absorbed_to_local(self):
+        """R11 갱신: extract_image provider='gemini' 도 하드 로컬 가드로 로컬 경로에
+        흡수 — _gemini_image 미호출, ollama 경로 처리(외부 cloud 원천 차단 계약)."""
         with patch.object(ox, "EXTRACT_PROVIDER", "ollama_cloud"), \
-             patch.object(ox, "_gemini_image", return_value="GEMINI_IMG") as mg, \
-             patch.object(ox, "_ollama_vision") as mo:
+             patch.object(ox, "_gemini_image") as mg, \
+             patch.object(ox, "render_image_to_base64", return_value=("b64", "image/png")), \
+             patch.object(ox, "_ollama_vision", return_value="OLLAMA_IMG") as mo:
             result = ox.extract_image("p", Path("/x.png"), provider="gemini")
-            self.assertEqual(result, "GEMINI_IMG")
-            mg.assert_called_once()
-            mo.assert_not_called()
+            self.assertEqual(result, "OLLAMA_IMG")
+            mo.assert_called_once()
+            mg.assert_not_called()
 
     def test_extract_image_default_preserved(self):
         """extract_image 미지정 → ollama 경로 (기존 동작 보존)."""
@@ -735,9 +757,14 @@ class TestProviderOverrideRouting(unittest.TestCase):
             mpp.assert_called_once_with("p", Path("/x.pdf"), 3, 3, provider="gemini")
 
     def test_provider_label_override(self):
-        """provider_label 이 override 인자에 따라 라벨 전환."""
+        """provider_label 이 _resolve_provider 결과를 따른다.
+
+        R11 갱신: 하드 로컬 가드로 'gemini' 인자도 ollama_cloud 라벨로 흡수된다
+        (라벨이 실제 실행 경로와 일치해야 로그가 진실 — 구 'gemini(...)' 라벨 기대는
+        가드 이전 사양)."""
         with patch.object(ox, "EXTRACT_PROVIDER", "ollama_cloud"):
-            self.assertIn("gemini", ox.provider_label("gemini"))
+            self.assertIn("ollama_cloud", ox.provider_label("gemini"))
+            self.assertNotIn("File API", ox.provider_label("gemini"))
             self.assertIn("ollama_cloud", ox.provider_label("ollama_cloud"))
             # None → 모듈 기본값
             self.assertIn("ollama_cloud", ox.provider_label())
@@ -772,26 +799,29 @@ class TestGeminiModelHelper(unittest.TestCase):
             with self.assertRaises(ox.ExtractError):
                 ox._gemini_model()
 
-    def test_configures_with_key_and_default_model(self):
-        """키 존재 시 configure(api_key=...) + 기본 모델명으로 생성."""
-        fake_genai, fake_model = self._patched_genai()
-        with patch.dict("sys.modules", {"google.generativeai": fake_genai}), \
-             patch.dict(os.environ, {"GEMINI_API_KEY": "dummy-key"}):
-            genai, gmodel = ox._gemini_model()
-            self.assertIs(genai, fake_genai)
-            self.assertIs(gmodel, fake_model)
-            fake_genai.configure.assert_called_once_with(api_key="dummy-key")
-            fake_genai.GenerativeModel.assert_called_once_with(
-                model_name=ox.GEMINI_VISION_MODEL
-            )
+    def test_hard_local_guard_blocks_even_with_key(self):
+        """R11 갱신: 하드 로컬 가드(2026-06-30) — 키가 있어도 _gemini_model 은 즉시
+        ExtractError 로 차단되고 genai.configure/GenerativeModel 은 절대 호출되지
+        않는다(외부 cloud 원천 차단 defense-in-depth).
 
-    def test_explicit_model_name_used(self):
-        """명시 model_name 이 GenerativeModel 로 전달."""
+        (구) test_configures_with_key_and_default_model / test_explicit_model_name_used
+        는 configure+GenerativeModel 배선을 검증했으나, 가드 도입으로 그 배선은
+        도달 불가한 사(死)경로가 됐다 — 검증 의도 자체가 무효화되어 본 테스트로 대체
+        (사유: 하드 로컬 전환이 gemini 생성 경로를 계약상 폐쇄)."""
         fake_genai, _ = self._patched_genai()
         with patch.dict("sys.modules", {"google.generativeai": fake_genai}), \
              patch.dict(os.environ, {"GEMINI_API_KEY": "dummy-key"}):
-            ox._gemini_model("custom-model-x")
-            fake_genai.GenerativeModel.assert_called_once_with(model_name="custom-model-x")
+            with self.assertRaises(ox.ExtractError) as ctx:
+                ox._gemini_model()
+            self.assertIn("하드 로컬 가드", str(ctx.exception))
+            fake_genai.configure.assert_not_called()
+            fake_genai.GenerativeModel.assert_not_called()
+        # 명시 model_name 을 줘도 동일하게 차단(모델명 무관 원천 차단).
+        with patch.dict("sys.modules", {"google.generativeai": fake_genai}), \
+             patch.dict(os.environ, {"GEMINI_API_KEY": "dummy-key"}):
+            with self.assertRaises(ox.ExtractError):
+                ox._gemini_model("custom-model-x")
+            fake_genai.GenerativeModel.assert_not_called()
 
     def test_gemini_pdf_pages_uses_helper(self):
         """_gemini_pdf_pages 리팩토링 후에도 upload/generate/delete 흐름 동일."""
@@ -824,18 +854,23 @@ class TestGeminiModelHelper(unittest.TestCase):
             fake_genai.upload_file.assert_called_once()
             fake_genai.delete_file.assert_called_once_with("files/img1")
 
-    def test_extract_text_prompt_gemini_uses_helper(self):
-        """extract_text_prompt gemini 경로가 _gemini_model 헬퍼 경유 (중복 제거)."""
+    def test_extract_text_prompt_gemini_absorbed_to_local(self):
+        """R11 갱신: EXTRACT_PROVIDER='gemini' 여도 extract_text_prompt 는 하드 로컬
+        가드로 ollama 텍스트 경로에 흡수 — _gemini_model 헬퍼는 절대 호출되지 않는다.
+
+        (구) 'gemini 경로가 _gemini_model 경유' 기대는 가드 이전 사양. 구 테스트는
+        흡수로 인해 실제 로컬 LLM 을 라이브 호출까지 했음(테스트 격리 위반) —
+        _ollama_vision 을 명시 mock 해 네트워크 0 으로 교정."""
         fake_genai, fake_model = self._patched_genai()
-        fake_resp = MagicMock()
-        fake_resp.text = "GEMINI TEXT MD"
-        fake_model.generate_content.return_value = fake_resp
         with patch.object(ox, "EXTRACT_PROVIDER", "gemini"), \
-             patch.object(ox, "_gemini_model", return_value=(fake_genai, fake_model)) as mh:
+             patch.object(ox, "_gemini_model",
+                          return_value=(fake_genai, fake_model)) as mh, \
+             patch.object(ox, "_ollama_vision", return_value="LOCAL TEXT MD") as mo:
             result = ox.extract_text_prompt("prompt-x")
-            self.assertEqual(result, "GEMINI TEXT MD")
-            mh.assert_called_once()
-            fake_model.generate_content.assert_called_once_with("prompt-x")
+            self.assertEqual(result, "LOCAL TEXT MD")
+            mh.assert_not_called()
+            mo.assert_called_once()
+            fake_model.generate_content.assert_not_called()
 
 
 # ──────────────────────────────────────────────────────────────────────────────

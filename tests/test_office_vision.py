@@ -341,6 +341,11 @@ class TestGracefulDegrade(unittest.TestCase):
 # (d) hwpx(ZIP) 말미 모아삽입 + hwp(바이너리) 텍스트만
 # ──────────────────────────────────────────────────────────────────────────────
 
+# R11(2026-07-15): 이 클래스는 patch("pyhwp2md.convert") 를 쓰므로 pyhwp2md 모듈
+# 자체가 import 가능해야 한다(선택 의존성). 미설치 venv 에서는 ModuleNotFoundError
+# 로 '실패'하던 것을 정당한 환경성 skip 으로 전환 — 설치 시 자동 재활성.
+@unittest.skipIf(importlib.util.find_spec("pyhwp2md") is None,
+                 "pyhwp2md 미설치 — HWP 변환 선택 의존성(환경성 skip, R11)")
 class TestHwpVisionPaths(unittest.TestCase):
 
     def setUp(self):

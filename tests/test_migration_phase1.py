@@ -61,16 +61,31 @@ def _git_show(rel_path: str) -> str:
     Phase 1/2 통합본이 HEAD 에 커밋되면서 원본 PROMPT_TEMPLATE 가 HEAD==워킹트리가
     되어버려, HEAD 기준 byte-동일 비교는 vacuous(자기 비교)가 된다. 통합 직전
     원본 상수를 기준으로 삼아야 프롬프트 드리프트 검출 teeth 가 유지된다.
+
+    R11(2026-07-15): PRE_INTEGRATION_REF 가 현 저장소 이력에 없으면(이력 재작성으로
+    객체 소실 — 재생성 불가) None 을 반환한다. 구(舊)구현은 check=True 라 수집
+    (collection) 단계에서 CalledProcessError 로 파일 전체가 죽었다 → 소비 테스트만
+    skipIf 로 명시 skip 하고, fixture(JSON) 기반 골든 비교는 git 무관하게 계속 수행.
     """
     r = subprocess.run(
         ["git", "show", f"{PRE_INTEGRATION_REF}:{rel_path}"],
-        capture_output=True, text=True, cwd=_ROOT, check=True,
+        capture_output=True, text=True, cwd=_ROOT, check=False,
     )
+    if r.returncode != 0:
+        return None  # R11: 원본 커밋 소실 — 소비 테스트는 skipIf 처리
     return r.stdout
+
+
+# R11: 원본 커밋 소실 시 skip 사유(소비 테스트 공통).
+_R11_ORIG_SKIP = ("PRE_INTEGRATION_REF 소실(저장소 이력 재작성) — 통합 직전 원본 "
+                  "대비 byte-비교 재현 불가(통합 시점 1회 완료된 역사적 게이트; "
+                  "fixture 기반 골든 비교는 계속 수행) R11 2026-07-15")
 
 
 def _load_const_from_src(src: str, attr: str, tag: str):
     """소스 문자열을 임시 파일로 저장 후 상수 추출 (mkdir 차단)."""
+    if src is None:
+        return None  # R11: 원본 커밋 소실(위 _git_show 참조)
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".py", encoding="utf-8", delete=False
     ) as f:
@@ -287,6 +302,7 @@ class TestGoldenEdaPyojun(unittest.TestCase):
 # 프롬프트 byte-동일 — 원본 git 상수 vs 워킹트리 상수 직접 비교
 # ──────────────────────────────────────────────────────────────────────────────
 
+@unittest.skipIf(_BD_ORIG_SRC is None or _EDA_ORIG_SRC is None, _R11_ORIG_SKIP)
 class TestPromptByteIdentical(unittest.TestCase):
     """마이그레이션 후 워킹트리 PROMPT_TEMPLATE 이 git-원본과 byte-동일해야 한다."""
 

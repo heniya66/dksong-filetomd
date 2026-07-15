@@ -89,9 +89,21 @@ class PipelineSnapshot:
         )
 
         # output_path 대조 — 양쪽 모두 캡처된 경우에만 (출력 경로 드리프트 검출).
+        # R11(2026-07-15): 머신 무관 정규화 비교로 전환. 골든 fixture 는 캡처 당시
+        # 머신의 '절대' 경로(/Users/heni/workspace/filestomdwgem/...)를 박제하고
+        # 있어, 다른 머신/레포명(filetomd)에서는 워크스페이스 접두가 달라 순수
+        # 환경 차이로 전멸했다(이 레포에서 한 번도 그린인 적 없던 이식 부채).
+        # 드리프트 teeth 의 실체는 'output/ 이하 구조 + 파일명'이므로 'output'
+        # 컴포넌트부터의 상대 경로로 대조한다(양쪽에 output 이 없으면 종전대로
+        # 절대 경로 대조 — 완화 아님).
         if self.output_path is not None and other.output_path is not None:
-            assert str(self.output_path) == str(other.output_path), (
-                f"{prefix}output_path 불일치:\n"
+            def _norm(p):
+                parts = Path(p).parts
+                if "output" in parts:
+                    return str(Path(*parts[parts.index("output"):]))
+                return str(p)
+            assert _norm(self.output_path) == _norm(other.output_path), (
+                f"{prefix}output_path 불일치(output/ 이하 정규화 비교):\n"
                 f"  원본: {self.output_path}\n"
                 f"  통합: {other.output_path}"
             )

@@ -75,16 +75,30 @@ def _git_show(rel_path: str) -> str:
     ⚠️ HEAD 가 아니라 통합 *직전* 커밋(PRE_INTEGRATION_REF)을 본다. 통합본이
     HEAD 에 커밋된 뒤로는 HEAD==워킹트리라 HEAD 기준 byte-동일 비교가 vacuous 가
     되므로, 통합 직전 원본 상수를 기준으로 삼아 프롬프트 드리프트 teeth 를 유지한다.
+
+    R11(2026-07-15): PRE_INTEGRATION_REF 가 현 저장소 이력에 없으면(이력 재작성으로
+    객체 소실 — 재생성 불가) None 반환. 소비 테스트만 skipIf 로 명시 skip 하고,
+    fixture(JSON) 기반 골든 비교는 git 무관하게 계속 수행한다.
     """
     r = subprocess.run(
         ["git", "show", f"{PRE_INTEGRATION_REF}:{rel_path}"],
-        capture_output=True, text=True, cwd=_ROOT, check=True,
+        capture_output=True, text=True, cwd=_ROOT, check=False,
     )
+    if r.returncode != 0:
+        return None  # R11: 원본 커밋 소실 — 소비 테스트는 skipIf 처리
     return r.stdout
+
+
+# R11: 원본 커밋 소실 시 skip 사유(소비 테스트 공통).
+_R11_ORIG_SKIP = ("PRE_INTEGRATION_REF 소실(저장소 이력 재작성) — 통합 직전 원본 "
+                  "대비 byte-비교 재현 불가(통합 시점 1회 완료된 역사적 게이트; "
+                  "fixture 기반 골든 비교는 계속 수행) R11 2026-07-15")
 
 
 def _load_const_from_src(src: str, attr: str, tag: str):
     """소스 문자열을 임시 파일로 저장 후 상수 추출 (mkdir 차단)."""
+    if src is None:
+        return None  # R11: 원본 커밋 소실(위 _git_show 참조)
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".py", encoding="utf-8", delete=False
     ) as f:
@@ -388,6 +402,8 @@ class TestGoldenImageAnalysis(unittest.TestCase):
 # 프롬프트 byte-동일 — 원본 git 상수 vs 워킹트리 상수 직접 비교
 # ──────────────────────────────────────────────────────────────────────────────
 
+@unittest.skipIf(_AVA2_ORIG_SRC is None or _PANGDAN_ORIG_SRC is None
+                 or _IMG_ORIG_SRC is None, _R11_ORIG_SKIP)
 class TestPromptByteIdentical(unittest.TestCase):
     """마이그레이션 후 워킹트리 PROMPT_TEMPLATE 이 git-원본과 byte-동일해야 한다."""
 
@@ -421,12 +437,15 @@ class TestRateLimitPreserved(unittest.TestCase):
     존재함을 정적으로 확인한다 (convert_pdf 내부 sleep 은 recorder 가 mock).
     """
 
+    @unittest.skipIf(_AVA2_ORIG_SRC is None, _R11_ORIG_SKIP)
     def test_ava2_orig_sleep_15(self):
         self.assertIn("time.sleep(15)", _AVA2_ORIG_SRC)
 
+    @unittest.skipIf(_PANGDAN_ORIG_SRC is None, _R11_ORIG_SKIP)
     def test_pangdan_orig_sleep_15(self):
         self.assertIn("time.sleep(15)", _PANGDAN_ORIG_SRC)
 
+    @unittest.skipIf(_IMG_ORIG_SRC is None, _R11_ORIG_SKIP)
     def test_image_analysis_orig_sleep_15(self):
         self.assertIn("time.sleep(15)", _IMG_ORIG_SRC)
 
@@ -510,12 +529,24 @@ class TestMigratedScriptHealth(unittest.TestCase):
 #   (assert_equals 가 내부 비교하지만, teeth 가 "물린다"는 것을 명시 테스트로 고정)
 # ──────────────────────────────────────────────────────────────────────────────
 
+def _norm_out(p) -> str:
+    """R11(2026-07-15): 머신 무관 output 경로 정규화 — 'output' 컴포넌트부터 상대화.
+
+    골든 fixture 는 캡처 머신의 절대 경로(/Users/heni/workspace/filestomdwgem/...)
+    를 박제하고 있어 다른 머신/레포명에서는 워크스페이스 접두만 달라 순수 환경
+    차이로 실패했다(이식 부채). 드리프트 teeth 의 실체 = output/ 이하 구조·파일명.
+    _pipeline_recorder.PipelineSnapshot.assert_equals 의 R11 정규화와 동일 규칙."""
+    parts = Path(p).parts
+    return str(Path(*parts[parts.index("output"):])) if "output" in parts else str(p)
+
+
 class TestOutputPathSeparatorTeeth(unittest.TestCase):
     """원본 record_script 가 쓴 경로 == 통합본 convert_pdf 가 쓴 경로.
 
     원본은 각자의 OUTPUT_DIR / 파일명 으로, 통합본은 호출자가 넘긴 output_path 로
-    저장한다. 두 경로가 byte-동일해야 출력 위치 드리프트가 없음을 보장한다.
+    저장한다. 두 경로가 (output/ 이하) 동일해야 출력 위치 드리프트가 없음을 보장.
     또한 단일/다중 청크 구분자(None vs '\\n\\n---\\n\\n')도 일치해야 한다.
+    (R11: byte-동일 → 머신 무관 정규화 비교 — _norm_out 참조.)
     """
 
     def test_ava2_output_path_matches_orig(self):
@@ -523,21 +554,21 @@ class TestOutputPathSeparatorTeeth(unittest.TestCase):
         migr = _golden_migrated_ava2(25)
         self.assertIsNotNone(orig.output_path)
         self.assertIsNotNone(migr.output_path)
-        self.assertEqual(orig.output_path, migr.output_path)
+        self.assertEqual(_norm_out(orig.output_path), _norm_out(migr.output_path))
         self.assertEqual(orig.output_path.name, "AVA_2.md")
 
     def test_pangdan_output_path_matches_orig(self):
         orig = _golden_orig_pangdan(25)
         migr = _golden_migrated_pangdan(25)
         # 양쪽 모두 하드코딩 PDF_PATH(판단서) 의 stem 으로 저장 → 동일.
-        self.assertEqual(str(orig.output_path), str(migr.output_path))
+        self.assertEqual(_norm_out(orig.output_path), _norm_out(migr.output_path))
         self.assertTrue(orig.output_path.name.endswith("판단서.md"),
                         f"예상치 못한 출력명: {orig.output_path.name}")
 
     def test_image_analysis_output_path_matches_orig(self):
         orig = _golden_orig_img(25)
         migr = _golden_migrated_img(25)
-        self.assertEqual(str(orig.output_path), str(migr.output_path))
+        self.assertEqual(_norm_out(orig.output_path), _norm_out(migr.output_path))
         self.assertEqual(orig.output_path.name, "img.md")
 
     def test_separator_matches_orig_single_and_multi(self):

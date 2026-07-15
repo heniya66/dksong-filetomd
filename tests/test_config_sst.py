@@ -88,8 +88,11 @@ class TestDefaultValues(unittest.TestCase):
         self.assertEqual(cfg.knob_extract_provider(), "ollama_cloud")
 
     def test_vision_model_default(self):
+        # R11(2026-07-15): 기대값 갱신 — 구 'gemini-3-flash-preview' 는 하드 로컬
+        # 전환(2026-06-30) + FIX D-R2(2026-07-09, 코드 기본 qwen3-vl:8b 교체) 이전
+        # 사양. 검증 의도(env/yaml 없는 '코드 기본값' 고정) 는 그대로 유지.
         cfg = self._cfg_no_env_no_yaml()
-        self.assertEqual(cfg.knob_vision_model(), "gemini-3-flash-preview")
+        self.assertEqual(cfg.knob_vision_model(), "qwen3-vl:8b-instruct-q8_0")
 
     def test_base_url_default(self):
         cfg = self._cfg_no_env_no_yaml()
@@ -402,7 +405,9 @@ class TestModuleConstantsViaConfig(unittest.TestCase):
             self.assertAlmostEqual(ox.OLLAMA_RETRY_MAX_DELAY, 60.0)
             self.assertAlmostEqual(ox.OLLAMA_RETRY_AFTER_CAP, 120.0)
             self.assertEqual(ox.EXTRACT_PROVIDER, "ollama_cloud")
-            self.assertEqual(ox.OLLAMA_VISION_MODEL, "gemini-3-flash-preview")
+            # R11(2026-07-15): 기대값 갱신 — 코드 기본 vision 모델은 FIX D-R2
+            # (2026-07-09) 이후 qwen3-vl:8b-instruct-q8_0 (하드 로컬 표준).
+            self.assertEqual(ox.OLLAMA_VISION_MODEL, "qwen3-vl:8b-instruct-q8_0")
             self.assertEqual(ox.OLLAMA_BASE_URL, "http://localhost:11434/v1")
 
     def test_vision_qa_dpi_constant(self):

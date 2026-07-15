@@ -46,16 +46,30 @@ def _git_show(rel_path: str) -> str:
 
     ⚠️ HEAD 가 아니라 통합 직전 커밋을 본다(통합본 커밋으로 HEAD 에서 원본
     process_pdf 가 사라졌기 때문). 원본 PROMPT_TEMPLATE/OUTPUT_DIR 상수 추출용.
+
+    R11(2026-07-15): PRE_INTEGRATION_REF 가 현 저장소 이력에 없으면(이력 재작성으로
+    객체 소실 — 재생성 불가) None 반환. 소비 테스트(TestGoldenComparison)만 skipIf
+    로 명시 skip — recorder 자체 검증(R-1/R-2/R-4)은 git 무관하게 계속 수행한다.
     """
     result = subprocess.run(
         ["git", "show", f"{PRE_INTEGRATION_REF}:{rel_path}"],
-        capture_output=True, text=True, cwd=_ROOT, check=True,
+        capture_output=True, text=True, cwd=_ROOT, check=False,
     )
+    if result.returncode != 0:
+        return None  # R11: 원본 커밋 소실 — 소비 테스트는 skipIf 처리
     return result.stdout
+
+
+# R11: 원본 커밋 소실 시 skip 사유(소비 테스트 공통).
+_R11_ORIG_SKIP = ("PRE_INTEGRATION_REF 소실(저장소 이력 재작성) — 통합 직전 원본 "
+                  "상수 대비 골든 비교 재현 불가(통합 시점 1회 완료된 역사적 게이트; "
+                  "recorder 자체 검증은 계속 수행) R11 2026-07-15")
 
 
 def _load_const_from_src(src: str, attr: str, module_name: str):
     """소스 문자열을 임시 파일로 저장 후 상수 추출 (mkdir 차단)."""
+    if src is None:
+        return None  # R11: 원본 커밋 소실(위 _git_show 참조)
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".py", encoding="utf-8", delete=False
     ) as f:
@@ -179,6 +193,7 @@ class TestRecordScriptBlockdiagram(unittest.TestCase):
 # R-3) git-원본 vs 통합본 골든 비교 — 비순환(non-vacuous)
 # ──────────────────────────────────────────────────────────────────────────────
 
+@unittest.skipIf(_BD_ORIG_SRC is None, _R11_ORIG_SKIP)
 class TestGoldenComparison(unittest.TestCase):
     """git-원본 스크립트와 마이그레이션된 convert_pdf 래퍼가 동일 시퀀스를 생성.
 
