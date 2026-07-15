@@ -113,13 +113,75 @@ def main():
     n_tables = 0
     n_cells = 0
 
+    # ── R12(2026-07-15): 페이지 걸침 sub-row 이동을 grid 측에 동일 적용 ──
+    # extract _xpage_registry_pass 가 continued 선두 fragment 를 이전 페이지 체인
+    # 행에 병합·이동하므로(md), 행 1:1 대조도 같은 이동을 grid 표현에 적용해야
+    # 어긋나지 않는다 — 공유 SSoT x._xpage_subrow_migrate (재구현 금지).
+    # 체인 판정(페이지-로컬 복제): ①연속 페이지 grids 존재 ②cont 첫 표가 페이지
+    # 상단(_STRADDLE_TOP_Y0_MAX) ③헤더 지문 일치(prev 마지막 grid ↔ cont 첫 grid)
+    # ④cont 첫 grid 에 자기 벡터 캡션 owner 없음(신규 표 배제 — audit gcap 규칙).
+    # 병합 열 bbox 는 SSoT 가 None 처리 → 불일치여도 자동 교체 없이 큐(안전측).
+    g3_by_page = {}
+    for p in range(1, npages + 1):
+        if p in mk:
+            g3_by_page[p] = grids_with_bboxes(x, pdf_path, p)
+    for p in sorted(g3_by_page):
+        prev, cur = g3_by_page.get(p - 1), g3_by_page.get(p)
+        if not prev or not cur:
+            continue
+        prow, pbbs, ptb = prev[-1]
+        crow, cbbs, ctb = cur[0]
+        if (ctb[1] or 0.0) > x._STRADDLE_TOP_Y0_MAX:
+            continue
+        if len(crow[0]) != len(prow[0]) or \
+                x._cc_norm_cells(crow[0]) != x._cc_norm_cells(prow[0]):
+            continue
+        try:
+            caps, vok = x._xpage_vec_table_captions(pdf_path, p)
+        except Exception:  # noqa: BLE001
+            caps, vok = [], False
+        if vok:
+            taken = set()
+            for (_num, _text, _y0, y1) in sorted(caps, key=lambda c: c[3]):
+                best_gap, best_gi = None, None
+                for gi2, (_r2, _b2, tb2) in enumerate(cur):
+                    gap = tb2[1] - y1
+                    if gap >= -5 and (best_gap is None or gap < best_gap):
+                        best_gap, best_gi = gap, gi2
+                if best_gi is not None and best_gi not in taken:
+                    taken.add(best_gi)
+            if 0 in taken:
+                continue   # 첫 grid 에 자기 캡션 — 신규 표(체인 아님)
+        # 적응 가드(audit 동일 규칙): md 가 선두 파편을 보존(구 R7 형식)하면 grid 측도
+        # 보존 — 구 산출물 검증 오탐 방지. md 파편 부재 시에만 R12 이동 적용(md 가
+        # 파편을 '유실'했다면 이전 페이지 행 대조에서 불일치로 드러남 — 건전성 유지).
+        nxt_p = min([v for k2, v in mk.items() if k2 > p], default=len(lines))
+        body_p = lines[mk[p] + 1:nxt_p]
+        blocks_p = x._xpage_blocks_with_html(body_p)
+        first_gfm = next((b for b in blocks_p if b[2] == "gfm"), None)
+        md_keeps_frag = False
+        if first_gfm:
+            nd = [k2 for k2 in range(first_gfm[0], first_gfm[1] + 1)
+                  if not SEP_RE.match(body_p[k2])][1:]
+            if nd:
+                md_keeps_frag = x._subrow_is_fragment(x._cc_cells(body_p[nd[0]]))
+        if md_keeps_frag:
+            continue
+        hn = x._grid_header_rows(crow)
+        pr2, cr2, nmig, pb2, cb2 = x._xpage_subrow_migrate(
+            prow, crow[hn:], pbbs, cbbs[hn:])
+        if nmig:
+            g3_by_page[p - 1][-1] = (pr2, pb2, ptb)
+            g3_by_page[p][0] = (list(crow[:hn]) + cr2,
+                                list(cbbs[:hn]) + cb2, ctb)
+
     for p in range(1, npages + 1):
         if p not in mk:
             continue
         nxt = min([v for k, v in mk.items() if k > p], default=len(lines))
         b0, b1 = mk[p] + 1, nxt          # body 절대 라인 범위 [b0, b1)
         body = lines[b0:b1]
-        g3 = grids_with_bboxes(x, pdf_path, p)
+        g3 = g3_by_page.get(p) or []
         blocks = x._xpage_blocks_with_html(body)
         gfm_blocks = [(s, e, k) for (s, e, k) in blocks if k == "gfm"]
         if not g3:

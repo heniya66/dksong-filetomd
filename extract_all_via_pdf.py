@@ -1372,6 +1372,73 @@ def _subrow_merge_rows(rows, cell_boxes=None):
     return out_r, out_b
 
 
+# ── R12(2026-07-15): 페이지 걸침 sub-row 파편의 체인 레벨 이동 (3도구 공유 SSoT) ──
+# R7 F-SUBROW 가드 (b)는 '페이지 상단 이월 파편(부모가 이전 페이지)'을 오병합 방지
+# 목적으로 보존했다 → continued 표 최상단에 anchor·Description 빈 값행이 독립 잔존
+# (사용자 실물 신고: Table 2 (continued) 상단 '0.064 (run length ≡ 0)' 행 등).
+# RAG 영향: 꼬리 값 청크에 anchor 토큰이 없어 검색 누락/귀속 불확실.
+# 본 함수는 원장(_xpage_registry_pass)이 지문으로 확정한 continued 체인 안에서만
+# 그 파편을 직전 체인 블록(이전 페이지 표)의 마지막 논리 행에 병합한다.
+# ★도구 동기화: 행이 페이지 블록을 넘어 이동하므로 doc_audit(c_cells 페이지별 행
+#   대조)·cross_verify(행 1:1)도 본 함수를 grid 측에 동일 적용해 대조한다
+#   (R7 _subrow_merge_rows SSoT 패턴의 체인 확장판 — 별도 재구현 금지).
+def _xpage_subrow_migrate(prev_rows, cont_rows, prev_boxes=None, cont_boxes=None):
+    """continued 선두의 연속 fragment 행들을 prev 마지막 행에 병합(체인 SSoT).
+
+    Args:
+        prev_rows: 체인 직전 블록(이전 페이지 표) 행들 — 마지막 행이 병합 대상
+                   (논리 부모). 헤더 포함이어도 무방(마지막 행만 본다).
+        cont_rows: 연속분 표의 '데이터' 행들(반복 헤더 제외). 선두의 연속
+                   fragment(_subrow_is_fragment — R7 판정 SSoT 재사용)만 이동.
+        prev_boxes/cont_boxes: cross_verify 용 셀 bbox (없으면 None).
+
+    Returns:
+        (prev_rows2, cont_rows2, n_migrated, prev_boxes2, cont_boxes2)
+        n_migrated == 0 이면 입력 사본 그대로(무변경).
+        병합된 열의 prev bbox 는 None — 페이지 경계 union 은 위치 증거로 무효
+        (cross_verify 는 bbox 없는 셀을 자동 교체하지 않고 큐로만 처리).
+
+    발동: FMDW_SUBROW_MERGE + FMDW_XPAGE_CONT 둘 다 ON (어느 하나 OFF = 무변경).
+    가드: ①prev 마지막 행 anchor(0열) 비공란(진짜 새 표의 우연한 빈 anchor 첫 행
+          케이스는 호출부의 지문 일치 체인 조건이 1차 방어, 본 가드가 2차)
+          ②cont 선두 '연속' fragment run 만(중간 fragment 는 R7 within-page 소관)."""
+    pr = [list(r) for r in prev_rows]
+    cr = [list(r) for r in cont_rows]
+    pb = [list(b) for b in prev_boxes] if prev_boxes is not None else None
+    cb = [list(b) for b in cont_boxes] if cont_boxes is not None else None
+    if not (_subrow_merge_enabled() and _xpage_cont_enabled()):
+        return pr, cr, 0, pb, cb
+    if not pr or not cr:
+        return pr, cr, 0, pb, cb
+    if not ((pr[-1][0] if pr[-1] else "") or "").strip():
+        return pr, cr, 0, pb, cb   # 가드①: 부모 anchor 공란 → 보존(오병합 방지)
+    nfrag = 0
+    while nfrag < len(cr) and _subrow_is_fragment(cr[nfrag]):
+        nfrag += 1
+    if nfrag == 0:
+        return pr, cr, 0, pb, cb
+    join = _subrow_join()
+    tgt = pr[-1]
+    tb = pb[-1] if pb is not None else None
+    for i in range(nfrag):
+        for j, v in enumerate(cr[i]):
+            v = (v or "").strip()
+            if not v:
+                continue
+            while len(tgt) <= j:
+                tgt.append("")
+            base = (tgt[j] or "").strip()
+            tgt[j] = (base + join + v) if base else v
+            if tb is not None:
+                while len(tb) <= j:
+                    tb.append(None)
+                tb[j] = None   # 페이지 경계 병합 셀 — bbox 위치 증거 무효화
+    del cr[:nfrag]
+    if cb is not None:
+        del cb[:nfrag]
+    return pr, cr, nfrag, pb, cb
+
+
 def _numeric_col_align_enabled() -> bool:
     return os.getenv("FMDW_NUMERIC_COL_ALIGN", "1").strip().lower() not in (
         "0", "false", "off", "no")
@@ -2207,6 +2274,7 @@ def _xpage_registry_pass(md: str, pdf_path) -> str:
     changed_any = False
     open_tbl = None          # (num, title) — 직전 페이지 마지막 grid 의 소속 표
     prev_last_hdr = None     # 직전 페이지 마지막 grid 헤더 셀
+    prev_grid_si = None      # R12: grids 를 가진 직전 세그먼트 index(체인 병합 대상)
     for si in range(len(segments)):
         pg = segments[si][1]
         if pg is None:
@@ -2219,10 +2287,11 @@ def _xpage_registry_pass(md: str, pdf_path) -> str:
         grids = sorted(grids, key=lambda gb: gb[1][1])
         caps, vec_ok = _xpage_vec_table_captions(pdf_path, pg)
         if not grids:
-            open_tbl, prev_last_hdr = None, None
+            open_tbl, prev_last_hdr, prev_grid_si = None, None, None
             continue
         if not vec_ok:
             open_tbl, prev_last_hdr = None, grids[-1][0][0]
+            prev_grid_si = si   # R12
             XPAGE_QA_NOTES.append(f"p{pg}: vector read failed — registry skipped")
             continue
         # ── 원장: 캡션→grid 귀속(y-근접) ──
@@ -2247,6 +2316,57 @@ def _xpage_registry_pass(md: str, pdf_path) -> str:
                 f"p{pg}: top table has no caption and fingerprint mismatch — "
                 "left uncaptioned (human review)")
         changed = False
+
+        # ── (1.5) R12(2026-07-15): 페이지 걸침 sub-row 파편 체인 병합 ──
+        # 지문 일치 continued(is_cont) 표 최상단의 연속 fragment 행(R7 가드 (b)가
+        # 보존했던 이월 파편)을 직전 체인 블록(이전 페이지 표) 마지막 논리 행에
+        # 병합하고 연속분에서 제거(_xpage_subrow_migrate SSoT). md 측 추가 가드:
+        # 직전 세그먼트 '마지막' gfm 블록의 헤더가 연속분 헤더와 지문 일치할 때만
+        # (체인 꼬리 확인 — 전페이지 블록이 소진/이형이면 보수적으로 보존).
+        migrated_g0_consumed = False   # 연속분 블록이 파편만이어서 통째 소진되었는가
+        if is_cont and _subrow_merge_enabled() and prev_grid_si is not None:
+            blocks_m = _xpage_blocks_with_html(body)
+            mapping_m = _xpage_match_blocks_to_grids(body, blocks_m, grids)
+            bi0 = next((bi for bi, g2 in mapping_m.items() if g2 == 0), None)
+            if bi0 is not None and blocks_m[bi0][2] == "gfm":
+                s0, e0, _k0 = blocks_m[bi0]
+                nd = [k for k in range(s0, e0 + 1)
+                      if not _XPAGE_SEP_RE.match(body[k])]
+                hdr_idx, data_idx = (nd[0], nd[1:]) if nd else (None, [])
+                cont_cells = [_cc_cells(body[k]) for k in data_idx]
+                pbody = segments[prev_grid_si][2]
+                pblocks = [b for b in _xpage_blocks_with_html(pbody)
+                           if b[2] == "gfm"]
+                if pblocks and cont_cells and hdr_idx is not None:
+                    ps, pe, _pk = pblocks[-1]
+                    p_data = [k for k in range(ps, pe + 1)
+                              if not _XPAGE_SEP_RE.match(pbody[k])]
+                    hdr_match = bool(p_data) and (
+                        _cc_norm_cells(_cc_cells(pbody[p_data[0]]))
+                        == _cc_norm_cells(_cc_cells(body[hdr_idx])))
+                    if hdr_match and len(p_data) >= 2:
+                        prev_last_cells = _cc_cells(pbody[p_data[-1]])
+                        pr2, cr2, nmig, _pb2, _cb2 = _xpage_subrow_migrate(
+                            [prev_last_cells], cont_cells)
+                        if nmig:
+                            pbody[p_data[-1]] = ("| " + " | ".join(pr2[-1])
+                                                 + " |")
+                            drop_lines = set(data_idx[:nmig])
+                            if not cr2:
+                                # 연속분이 파편만으로 구성 → 블록 전체(헤더/구분선
+                                # 포함) 소진. 빈 표를 만들지 않고 원천 제거하며,
+                                # 이후 (2b) 재삽입·(3) continued 캡션·(5a) 선두
+                                # 재배치는 본 플래그로 스킵(빈 표 가드 (6)과 정합).
+                                drop_lines.update(range(s0, e0 + 1))
+                                migrated_g0_consumed = True
+                            body = [l for k2, l in enumerate(body)
+                                    if k2 not in drop_lines]
+                            changed = True
+                            changed_any = True   # prev 세그먼트도 변경됨(in-place)
+                            print(f"    [XPAGE-REG] p{pg}: R12 페이지 걸침 sub-row "
+                                  f"{nmig}행 → 이전 페이지 체인 행 병합"
+                                  + (" (연속분 블록 소진)"
+                                     if migrated_g0_consumed else ""), flush=True)
 
         # ── (4) 캡션 헤딩화/형식 정정 + (2) 복원 준비: 기존 md 캡션 넘버 수집 ──
         def _cap_nums():
@@ -2324,6 +2444,10 @@ def _xpage_registry_pass(md: str, pdf_path) -> str:
         # 삽입. 산문 전사분은 삭제하지 않음(산문 불변 원칙 — QA 노트로 사람 확인).
         mapped_g = set(mapping.values())
         for gi in range(len(grids)):
+            # R12: 파편 이동으로 md 에서 의도적으로 소진된 grid 0 은 재삽입 금지
+            # (내용은 이전 페이지 체인 행으로 이관됨 — 미반영이 아니라 이관).
+            if gi == 0 and migrated_g0_consumed:
+                continue
             if gi in mapped_g or not _table_well_formed(grids[gi][0]):
                 continue
             gfm_lines = _render_grid_gfm(grids[gi][0])
@@ -2357,7 +2481,8 @@ def _xpage_registry_pass(md: str, pdf_path) -> str:
             print(f"    [XPAGE-REG] p{pg}: 미반영 grid {gi} → find_tables GFM 삽입"
                   f"(행 {len(grids[gi][0])})", flush=True)
         # ── (3) continued 삽입(지문 전용) ──
-        if is_cont and blocks and mapping.get(0) == 0:
+        # R12: 연속분 블록이 파편 이동으로 소진되면 캡션 삽입도 스킵(빈 캡션 방지).
+        if is_cont and not migrated_g0_consumed and blocks and mapping.get(0) == 0:
             b0s = blocks[0][0]
             k = b0s - 1
             while k >= 0 and _cc_is_skip(body[k].strip()):
@@ -2375,7 +2500,8 @@ def _xpage_registry_pass(md: str, pdf_path) -> str:
                 body[ins_at:ins_at] = ls
             changed = True
         # ── (5a) 연속분 첫 표 블록(+직상단 캡션)을 페이지 선두로 ──
-        if is_cont:
+        # R12: 소진 시 첫 블록은 무관한 표 — 선두 재배치 스킵.
+        if is_cont and not migrated_g0_consumed:
             blocks = _xpage_blocks_with_html(body)
             if blocks and blocks[0][2] == "gfm":
                 s0, e0, _ = blocks[0]
@@ -2545,6 +2671,7 @@ def _xpage_registry_pass(md: str, pdf_path) -> str:
             elif not is_cont:
                 open_tbl = None
         prev_last_hdr = grids[-1][0][0]
+        prev_grid_si = si   # R12: 이 세그먼트가 다음 페이지의 체인 병합 대상
     if not changed_any:
         return md
     out = []

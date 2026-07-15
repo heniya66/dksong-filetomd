@@ -22,6 +22,9 @@ usage: .venv/bin/python doc_audit.py <md_path> <pdf_path>
                  통째 소실 같은 산문 유실을 결정론 검출한다.
   (R7 F-SUBROW: c_cells 는 extract 의 _subrow_merge_rows 를 grid 측에 동일 적용해
    병합 렌더와 1:1 대조 — 규칙 SSoT 는 extract 모듈, 재구현 금지)
+  (R12: 페이지 걸침 sub-row 는 extract 의 _xpage_subrow_migrate 를 체인(cont_pages)
+   grid 측에 동일 적용 — 이동 행은 이전 페이지 grid 마지막 행에서 대조되고, 소진된
+   grid(데이터 0)는 md 블록/continued 캡션 부재가 정상 계약)
 
 한계(해석 주의, Advisor 2026-07-14 / R9 갱신 2026-07-15): 표 계열 검사(c/d/e 등)의
 "CLEAN"은 **find_tables(PyMuPDF) 추출 결과와의 자기정합** 증명이고, g_prose(R9)는
@@ -152,6 +155,41 @@ def main():
         else:
             open_tbl, prev_hdr = None, None
 
+    # ── R12(2026-07-15): 페이지 걸침 sub-row 이동을 grid 측에 동일 적용 ──
+    #    extract _xpage_registry_pass 가 continued 선두 fragment 행을 이전 페이지
+    #    체인 행에 병합·이동하므로(md 측), 페이지별 행 대조(c_cells)도 같은 이동을
+    #    grid 표현에 적용해야 1:1 이 유지된다 — 공유 SSoT x._xpage_subrow_migrate
+    #    (재구현 금지, R7 _subrow_merge_rows 패턴의 체인 확장판). 누락 시 cont
+    #    페이지는 잉여 grid 행(거짓 FAIL), 이전 페이지는 md 잉여 행으로 어긋난다.
+    #    bbox(grids[i][1])는 유지 — g_prose 의 표 영역 제외는 벡터 사실 기준.
+    for p in sorted(cont_pages):
+        pd, prevd = page_data.get(p), page_data.get(p - 1)
+        if not pd or not prevd or not pd[1] or not prevd[1]:
+            continue
+        # 적응 가드: md 측이 실제로 이동했는지 감지 — 구(R7) 산출물은 md 가 선두
+        # 파편을 '보존'하므로 grid 측도 보존해야 참(FAIL 오탐 방지). md 선두 파편이
+        # 없는데 grid 에 있으면 R12 이동본 → grid 측도 이동. md 가 파편을 '유실'한
+        # 경우에는 이동해도 이전 페이지 행 지문이 어긋나 c_cells 가 FAIL — 건전성 유지.
+        body_p = pd[0]
+        blocks_p = x._xpage_blocks_with_html(body_p)
+        first_gfm = next((b for b in blocks_p if b[2] == "gfm"), None)
+        md_keeps_frag = False
+        if first_gfm:
+            nd = [k for k in range(first_gfm[0], first_gfm[1] + 1)
+                  if not SEP_RE.match(body_p[k])][1:]
+            if nd:
+                md_keeps_frag = x._subrow_is_fragment(x._cc_cells(body_p[nd[0]]))
+        if md_keeps_frag:
+            continue   # 구 형식(R7 보존) 산출물 — grid 측도 그대로
+        prev_g, prev_b = prevd[1][-1]
+        cont_g, cont_b = pd[1][0]
+        hn = x._grid_header_rows(cont_g)
+        prev_m, _ = x._subrow_merge_rows(prev_g)   # extract 렌더 상태와 동일화(멱등)
+        pr2, cr2, nmig, _pb, _cb = x._xpage_subrow_migrate(prev_m, cont_g[hn:])
+        if nmig:
+            prevd[1][-1] = (pr2, prev_b)
+            pd[1][0] = (list(cont_g[:hn]) + cr2, cont_b)
+
     for p, (body, grids, caps, gcap, vok) in sorted(page_data.items()):
         if not vok:
             fail("a_captions", p, "vector read failed (manual review)")
@@ -215,7 +253,13 @@ def main():
                 fail("b_continued", p, f"'(continued)' on non-CONT page: '{t[:60]}'")
             elif str(cont_pages[p][0]) != str(n):
                 fail("b_continued", p, f"chain num {cont_pages[p][0]} != md {n}")
-        if p in cont_pages:
+        # R12: 연속분 첫 grid 가 파편 이동으로 소진(데이터 행 0)되면 md 에 continued
+        # 블록/캡션이 없는 것이 정상 계약 — b2 완전성 검사 면제.
+        _g0_consumed = False
+        if p in cont_pages and grids:
+            _g0m, _ = x._subrow_merge_rows(grids[0][0])
+            _g0_consumed = len(_g0m) <= x._grid_header_rows(_g0m)
+        if p in cont_pages and not _g0_consumed:
             b0 = blocks[0] if blocks else None
             ok2 = False
             if b0:
@@ -234,6 +278,11 @@ def main():
         for gi, (g, _b) in enumerate(grids):
             bi = next((b for b, gg in mapping.items() if gg == gi), None)
             if bi is None:
+                # R12: 파편 이동으로 데이터 행이 0 이 된 grid(소진)는 md 블록이
+                # 없는 것이 정상(내용은 이전 페이지 체인 행으로 이관됨) — 면제.
+                _gm, _ = x._subrow_merge_rows(g)
+                if len(_gm) <= x._grid_header_rows(_gm):
+                    continue
                 fail("d_structure", p, f"grid {gi} (rows={len(g)}) has no md table")
                 continue
             s, e, kind = blocks[bi]
