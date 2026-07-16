@@ -88,6 +88,12 @@ def main():
     def fail(check, page, detail):
         fails.append({"check": check, "page": page, "detail": detail})
 
+    # R13(2026-07-16): 경고(WARN) 채널 — CLEAN/FAIL 판정·exit code 와 무관(비차단).
+    warns = []
+
+    def warn(check, page, detail):
+        warns.append({"check": check, "page": page, "detail": detail})
+
     # ── f_coverage ──
     missing_mk = [p for p in range(1, npages + 1) if p not in mk]
     if missing_mk:
@@ -412,9 +418,48 @@ def main():
         except Exception as e2:  # noqa: BLE001 — 게이트 실행 실패는 가시화(수동검수)
             fail("g_prose", p, f"prose scan error (manual review): {e2}")
 
+        # ── dup_prose(R13) WARN: 표 셀 문장(≥5 단어)이 표 밖 평문으로 그대로 중복 ──
+        #    경고 수준(비차단, CLEAN/FAIL 불변). 원인은 완전성 가드가 grid 치환에서
+        #    드롭된 표 셀 텍스트를 loose-prose 로 회수한 뒤 doc-level 표 복원과 겹친 것.
+        #    판정: grid 셀(≥5 단어) 정규화 문자열을, 표 블록 밖 body 라인(≥5 단어)의
+        #    정규화가 부분문자열로 포함하면(다문장 셀의 문장 단위 중복 포함) WARN.
+        try:
+            tbl_line_idx = set()
+            for (bs, be, _bk) in blocks:
+                tbl_line_idx.update(range(bs, be + 1))
+            cell_norms = set()
+            for (g, _b) in grids:
+                for r in g:
+                    for c in r:
+                        ct = (c or "").strip()
+                        if len(ct.split()) >= 5:
+                            cn = norm(ct)
+                            if cn:
+                                cell_norms.add(cn)
+            if cell_norms:
+                for i, l in enumerate(body):
+                    if i in tbl_line_idx:
+                        continue
+                    ls = l.strip()
+                    if (not ls or ls.startswith("|") or ls.startswith("<!--")
+                            or ls.startswith("#") or ls == "---"):
+                        continue
+                    if len(ls.split()) < 5:
+                        continue
+                    ln = norm(ls)
+                    if ln and any(ln in cn for cn in cell_norms):
+                        warn("dup_prose", p,
+                             f"table cell sentence duplicated as loose prose: "
+                             f"'{ls[:70]}'")
+        except Exception as e3:  # noqa: BLE001 — 비차단(경고 채널)
+            warn("dup_prose", p, f"dup_prose scan error: {e3}")
+
     counts = {}
     for f2 in fails:
         counts[f2["check"]] = counts.get(f2["check"], 0) + 1
+    warn_counts = {}
+    for w2 in warns:
+        warn_counts[w2["check"]] = warn_counts.get(w2["check"], 0) + 1
     out = {
         "md": os.path.abspath(md_path),
         "pdf": os.path.abspath(pdf_path),
@@ -423,9 +468,12 @@ def main():
         # 아님), g_prose(R9) = PDF 벡터 텍스트 별도 축 — 헤더 주석 참조.
         "truth_source": "find_tables+vector_text(g_prose)",
         "cont_pages": {str(k): f"Table {v[0]}" for k, v in sorted(cont_pages.items())},
+        # status 는 fails 만 반영(R13 dup_prose 경고는 비차단 — CLEAN 판정 불변).
         "status": "CLEAN" if not fails else "FAIL",
         "summary": counts,
         "failures": fails,
+        "warn_summary": warn_counts,
+        "warnings": warns,
     }
     print(json.dumps(out, ensure_ascii=False, indent=1))
     return 0 if not fails else 1

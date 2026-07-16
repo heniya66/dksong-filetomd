@@ -940,7 +940,7 @@ def _line_covered(line_text: str, body_tokens: set) -> bool:
     return hits / len(st) >= 0.60
 
 
-def _recover_absent_blocks(clean_lines, body_md: str):
+def _recover_absent_blocks(clean_lines, body_md: str, exclude_mask=None):
     """읽기순 PDF 라인(F1/F2 정제)에서 본문에 없는 연속 블록(run)을 복구.
 
     반환: (recovered[run 별 라인], run_spans[(a,b)], covered[라인별 bool], total).
@@ -949,6 +949,13 @@ def _recover_absent_blocks(clean_lines, body_md: str):
       있을 때 뒤 블록이 앞으로 튀는 것 방지).
     가드: run 내 최소 1줄이 유의미토큰 ≥3(스트레이 단어 run 배제). 이미 본문에 있는
     라인(normalized substring)·이미 복구한 라인은 스킵(중복 0).
+
+    exclude_mask(2026-07-16, R13): clean_lines 와 같은 길이의 bool 리스트. True 인 라인은
+    강제로 covered 로 간주해 run 에서 제외한다(복구 안 함). find_tables 가 검출한 잘-형성된
+    표 셀 bbox 안에 있는 라인(=표 콘텐츠)을 loose-prose 로 회수하지 않기 위한 것. 표 콘텐츠는
+    그리드/xpage 표 경로가 담당하므로, 페이지 grid 치환이 그 표를 (동일-헤더 오매칭 등으로)
+    드롭해도 완전성 가드가 셀 텍스트를 표 밖 산문으로 쏟아내는 dup-prose 사고를 막는다.
+    None 이면 기존 동작 바이트 동일(doc-level figure 재배치 호출은 미전달 → 무영향).
     """
     if not clean_lines or not body_md:
         return [], [], [], 0
@@ -957,6 +964,9 @@ def _recover_absent_blocks(clean_lines, body_md: str):
         body_tokens.update(_sig_tokens(bl))
     body_norm = _norm_present(body_md)
     covered = [_line_covered(l[4], body_tokens) for l in clean_lines]
+    if exclude_mask is not None:
+        covered = [c or bool(exclude_mask[k]) if k < len(exclude_mask) else c
+                   for k, c in enumerate(covered)]
     n = len(clean_lines)
     runs = []
     i = 0
@@ -1127,6 +1137,32 @@ def _place_recovered_blocks(clean_lines, covered, run_spans, recovered, body_lin
     return text + "\n"
 
 
+def _table_region_mask(pdf_path, page: int, clean_lines):
+    """clean_lines 각 라인이 find_tables 잘-형성된 표 셀 bbox 안에 있는지 bool 마스크.
+
+    _grid_page_info 의 grids((grid,bbox), well-formed only)를 재사용하고, in-grid 판정은
+    _grid_page_info 내부 _in_grid 와 동일 계약(y-밴드 + x-겹침 — 옆 단 산문 오분류 방지).
+    grid 표가 비활성/미검출이거나 실패면 None(→ 완전성 가드 기존 동작 바이트 동일)."""
+    if not clean_lines or not _grid_tables_enabled():
+        return None
+    try:
+        grids, _ph, _n = _grid_page_info(pdf_path, page)
+    except Exception:  # noqa: BLE001 — 비차단(마스크 없이 기존 동작)
+        return None
+    if not grids:
+        return None
+    mask = []
+    for l in clean_lines:
+        lx0, ly0, lx1 = l[0], l[1], l[2]
+        hit = False
+        for (_g, b) in grids:
+            if (b[1] - 2 <= ly0 <= b[3] + 2 and lx0 < b[2] + 2 and lx1 > b[0] - 2):
+                hit = True
+                break
+        mask.append(hit)
+    return mask
+
+
 def _apply_hybrid_completeness(pdf_path, page: int, body_md):
     """선택된 페이지 본문에 glm 이 누락한 PDF 벡터텍스트 블록을 '읽기 위치'에 복구.
 
@@ -1151,7 +1187,14 @@ def _apply_hybrid_completeness(pdf_path, page: int, body_md):
     except Exception as e:  # noqa: BLE001 — 완전성 가드 실패는 비차단(본문 그대로)
         print(f"    [~] p{page}: completeness 스캔 실패(무시): {e}", flush=True)
         return body_md
-    recovered, run_spans, covered, total = _recover_absent_blocks(clean_lines, body_md)
+    # R13(2026-07-16): find_tables 가 검출한 잘-형성된 표 셀 bbox 안의 PDF 라인은
+    # '표 콘텐츠'이므로 loose-prose 로 회수하지 않는다(dup-prose 방지). 페이지 grid 치환이
+    # 동일-헤더 오매칭 등으로 그 표를 드롭해도, 표는 grid/xpage 표 경로(doc-level 포함)가
+    # 복원하므로 완전성 가드가 셀 텍스트를 표 밖 산문으로 중복 배출하면 안 된다. 정상(표가
+    # 본문에 존재) 케이스에선 그 라인들이 이미 covered 라 exclude_mask 는 사실상 no-op.
+    exclude_mask = _table_region_mask(pdf_path, page, clean_lines)
+    recovered, run_spans, covered, total = _recover_absent_blocks(
+        clean_lines, body_md, exclude_mask=exclude_mask)
     if not recovered:
         return body_md
     print(f"    [COMPLETE] p{page}: recovered {total} lines", flush=True)

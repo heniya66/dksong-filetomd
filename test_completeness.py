@@ -519,6 +519,50 @@ check("YP6b p1-4 copyright still trailing (append)",
       and _yp_p14.index("Copyright") > _yp_p14.index("reserves the right"))
 
 
+# ── R13(2026-07-16): 표 셀 텍스트가 loose-prose 로 회수되는 dup-prose 방지 ──────────
+# (a) exclude_mask: True 인 인덱스는 강제 covered → 복구 제외. None 이면 기존 동작 불변.
+_r_none, _s_none, _c_none, _t_none = eap._recover_absent_blocks(COPY, body_missing)
+check("R13 exclude_mask=None → 기존 동작 유지(7 recovered)", _t_none == 7)
+_mask_all = [True] * len(COPY)
+_rm, _sm, _cm, _tm = eap._recover_absent_blocks(COPY, body_missing, exclude_mask=_mask_all)
+check("R13 exclude_mask all-True → 0 recovered", _tm == 0, repr(_tm))
+_mask_partial = [i >= 4 for i in range(len(COPY))]   # 마지막 3줄만 마스크
+_rp, _sp2, _cp, _tp = eap._recover_absent_blocks(COPY, body_missing, exclude_mask=_mask_partial)
+_flatp = [l for run in _rp for l in run]
+check("R13 exclude_mask partial → 마스크 라인 미복구",
+      _tp == 4 and all(not l.startswith(("Contact", "TEL", "Home")) for l in _flatp),
+      repr(_flatp))
+
+# (b) 실 PDF 회귀(중복 유발 픽스처): grid 치환에서 Table 10 이 드롭된 body(설명 셀이
+#     본문에 부재)에 완전성 가드를 걸어도, 표 셀 문장이 loose-prose 로 회수되지 않는다.
+#     패치 전에는 3개 설명 문장이 표 밖 평문으로 회수돼 dup-prose 가 발생했다.
+_dm_after = (
+    "3.2.7 Reserved Design and Utility Levels CAD Layer Table\n\n"
+    "| CAD Level | GDSII / OASIS Layer No. | GDSII / OASIS Data Type | Description |\n"
+    "| :--- | ---: | ---: | :--- |\n"
+    "| ADM | 212 | 3 | Reserved. |\n"
+    "| SCHKY | 212 | 59 | Reserved. |\n"
+)
+_dm_out = eap._apply_hybrid_completeness("input/pdf/DM_p0018-0047.pdf", 28, _dm_after)
+check("R13 DM p28 dup-prose 제거: 'Boundary Layer' 문장 미회수",
+      "Boundary Layer for cell Level dummy generation." not in _dm_out)
+check("R13 DM p28 dup-prose 제거: TRANSISTORCELL 설명 문장 미회수",
+      "transistor-like dummy cell" not in _dm_out
+      and "generated level by PDK fill deck" not in _dm_out)
+
+# (c) _table_region_mask: grid 셀 안 라인은 True(설명 라인 마스킹) — bbox 계약 검증.
+import fitz as _fitz  # noqa: E402
+_doc = _fitz.open("input/pdf/DM_p0018-0047.pdf")
+_clean28 = eap._twocol_page_lines(_doc[27])
+_doc.close()
+_mask28 = eap._table_region_mask("input/pdf/DM_p0018-0047.pdf", 28, _clean28)
+_desc_masked = bool(_mask28) and all(
+    _mask28[i] for i, l in enumerate(_clean28)
+    if ("Boundary Layer for cell Level" in l[4]
+        or "TRANSISTORCELL is generated" in l[4]))
+check("R13 _table_region_mask 가 표 셀 라인을 True 로 표시", _desc_masked)
+
+
 print("\n=== SUMMARY ===")
 print(f"FAILURES: {FAILS if FAILS else 'NONE — ALL PASS'}")
 sys.exit(1 if FAILS else 0)
