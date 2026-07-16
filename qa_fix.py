@@ -11,6 +11,9 @@ qa_scan.py 가 검출하는 AUTO-FIX 후보(중복 캡션·불릿 정규화·깨
      (fmdw.md FMDW_BULLET_LIST 표준과 동일 규칙. 코드펜스·표 행 제외).
   F3 broken image refs  : 링크 대상 부재 시, out_dir 에 동일 basename 이 유일하게
      실재하면 그 상대경로로 교정(figures/ 우선). 모호/부재 = 미수정(사람 몫).
+  F4 heading dedup       : 사이 공백 줄만 두고 동일제목(절번호·대소문자 무시)이
+     재출현하는 헤딩 → 뒤엣것 제거(선행 공백런도 함께 정리, extract_all_via_pdf.py
+     `_dedup_consecutive_headings` 와 동일 규칙). 내용/코드펜스 개재 시 미수정.
 
 사용:
   .venv/bin/python qa_fix.py <output_dir> [--md <name.md>] [--pdf <pdf>] [--apply]
@@ -35,10 +38,97 @@ FENCE_RE = re.compile(r"^\s*(```|~~~)")
 IMG_LINK_RE = re.compile(r"(!\[[^\]]*\]\()([^)]+)(\))")
 BULLET_RE = re.compile(r"^(\s*)•\s*(\S.*)$")
 SUBBULLET_RE = re.compile(r"^(\s*)–\s+(\S.*)$")
+HEADING_LINE_RE = re.compile(r"^(#{1,6})\s+(\S.*)$")
+LEADING_SECTION_NUM_RE = re.compile(r"^\d+(?:\.\d+)*\s+")
 
 
 def norm(s):
     return re.sub(r"[^a-z0-9]+", "", (s or "").lower())
+
+
+def heading_has_leading_number(title):
+    """제목 선두에 절 번호(`N.N.N `) 토큰이 있는지 여부."""
+    return bool(LEADING_SECTION_NUM_RE.match((title or "").strip()))
+
+
+def norm_heading(title):
+    """헤딩 제목 정규화(절번호 제거판): 선두 절 번호 제거 → 공백 정규화 → casefold.
+
+    '핵심 제목' 비교용 — 규칙(a)(뒤 헤딩이 무번호일 때만)에서만 사용.
+    extract_all_via_pdf.py `_norm_heading_title` 과 동일 규칙(SSoT 일치).
+    """
+    t = (title or "").strip()
+    t = LEADING_SECTION_NUM_RE.sub("", t, count=1)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t.casefold()
+
+
+def norm_heading_raw(title):
+    """헤딩 제목 정규화(절번호 보존판): 공백 정규화 → casefold(번호는 그대로 둠).
+
+    '원문 완전 동일' 비교용 — 규칙(b). `1 Overview` vs `1.1 Overview` 처럼 절번호가
+    다르면 여기서 반드시 불일치가 나야 한다(오제거 방지). extract_all_via_pdf.py
+    `_norm_heading_raw` 와 동일 규칙(SSoT 일치).
+    """
+    t = re.sub(r"\s+", " ", (title or "").strip()).strip()
+    return t.casefold()
+
+
+def scan_heading_dedup(lines):
+    """F4: 사이 공백 줄만 두고 동일제목 헤딩이 재출현하면 뒤엣것+선행 공백런을
+    드롭 후보로 표시. 내용·페이지마커·코드펜스 개재 시 미수정(보수 우선).
+
+    중복 판정 = 규칙(a) OR 규칙(b)(2026-07-16 정정, extract_all_via_pdf.py
+    `_dedup_consecutive_headings` 와 동일):
+      (a) 뒤 헤딩이 무번호이고 그 정규화 제목이 앞 헤딩의 절번호 제거 후 정규화
+          제목과 같을 때.
+      (b) 앞·뒤 원문 제목(절번호 보존, 레벨만 무시)이 완전히 같을 때.
+      → 양쪽 다 번호가 있고 번호가 다르면 절대 미수정(`1 Overview` vs
+        `1.1 Overview` 오제거 방지).
+    """
+    fixes = []
+    n = len(lines)
+    in_fence = False
+    i = 0
+    while i < n:
+        if FENCE_RE.match(lines[i]):
+            in_fence = not in_fence
+            i += 1
+            continue
+        if in_fence:
+            i += 1
+            continue
+        m = HEADING_LINE_RE.match(lines[i])
+        if not m:
+            i += 1
+            continue
+        anchor_title = m.group(2)
+        anchor_core = norm_heading(anchor_title)
+        anchor_raw = norm_heading_raw(anchor_title)
+        i += 1
+        while True:
+            j = i
+            while j < n and lines[j].strip() == "":
+                j += 1
+            if j >= n or FENCE_RE.match(lines[j]):
+                break
+            m2 = HEADING_LINE_RE.match(lines[j])
+            if not m2:
+                break
+            b_title = m2.group(2)
+            b_has_num = heading_has_leading_number(b_title)
+            b_raw = norm_heading_raw(b_title)
+            is_dup = ((not b_has_num and anchor_core == b_raw)
+                      or (anchor_raw == b_raw))
+            if not is_dup:
+                break
+            for k in range(i, j):
+                fixes.append({"kind": "heading_dedup_blank", "line": k + 1,
+                              "before": lines[k][:100], "after": None})
+            fixes.append({"kind": "heading_dedup", "line": j + 1,
+                          "before": lines[j].strip()[:100], "after": None})
+            i = j + 1
+    return fixes
 
 
 def plan_fixes(md_path: Path, out_dir: Path):
@@ -97,6 +187,8 @@ def plan_fixes(md_path: Path, out_dir: Path):
                 fixes.append({"kind": "broken_image_ref_unfixable", "line": i + 1,
                               "before": link, "after": None,
                               "note": "후보 %d개 — 사람 확인" % len(cands)})
+    # F4: 연속 동일제목 헤딩 dedup(별도 전용 스캐너 — 공백런 lookahead 필요).
+    fixes.extend(scan_heading_dedup(lines))
     return lines, fixes
 
 
@@ -114,6 +206,8 @@ def apply_fixes(lines, fixes):
         elif f["kind"] == "broken_image_ref":
             lines[i] = lines[i].replace("(" + f["before"] + ")",
                                         "(" + f["after_link"] + ")")
+        elif f["kind"] in ("heading_dedup", "heading_dedup_blank"):
+            drop.add(i)
     return [l for k, l in enumerate(lines) if k not in drop]
 
 

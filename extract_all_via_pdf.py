@@ -6832,6 +6832,118 @@ def _recover_missing_headings(md: str, pages_lines, size_to_level) -> str:
     return "\n".join(out)
 
 
+# ── R13b: 연속 동일제목 헤딩 자동제거(FMDW_HEADING_DEDUP, 기본 ON) — 2026-07-16 ──────
+# glm 런-투-런 편차로 동일 섹션 제목이 서로 다른 헤딩 레벨로 바로 뒤이어 재출현하는
+# 사고(실측: DM_p0018-0047.md p9 '## 3.2.3 SRAM ...' 직후 내용 없이 '### SRAM ...'
+# 재출현)를 결정론적으로 제거한다. 헤딩 A·B 사이에 공백 줄만 있을 때만 발동 —
+# 본문·표·이미지·페이지 마커 등 내용이 하나라도 개재하면 절대 제거하지 않는다
+# (안전 최우선). F8/F10/F11 로 헤딩이 전부 확정된 뒤, F9 불릿 정규화 전에 배선.
+def _heading_dedup_enabled() -> bool:
+    return os.getenv("FMDW_HEADING_DEDUP", "1").strip().lower() not in (
+        "0", "false", "off", "no")
+
+
+_HEADING_LINE_RE = re.compile(r"^(#{1,6})\s+(\S.*)$")
+_LEADING_SECTION_NUM_RE = re.compile(r"^\d+(?:\.\d+)*\s+")
+
+
+def _heading_has_leading_number(title: str) -> bool:
+    """제목 선두에 절 번호(`N.N.N `) 토큰이 있는지 여부."""
+    return bool(_LEADING_SECTION_NUM_RE.match(title.strip()))
+
+
+def _norm_heading_title(title: str) -> str:
+    """헤딩 제목 정규화(절번호 제거판): 선두 절 번호 제거 → 공백 정규화 → casefold.
+
+    '핵심 제목' 비교용 — 규칙(a)(뒤 헤딩이 무번호일 때만)에서만 사용한다.
+    """
+    t = title.strip()
+    t = _LEADING_SECTION_NUM_RE.sub("", t, count=1)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t.casefold()
+
+
+def _norm_heading_raw(title: str) -> str:
+    """헤딩 제목 정규화(절번호 보존판): 공백 정규화 → casefold(번호는 그대로 둠).
+
+    '원문 완전 동일' 비교용 — 규칙(b)에서 사용한다. `1 Overview` vs `1.1 Overview`
+    처럼 절번호가 다르면 여기서 반드시 불일치가 나야 한다(오제거 방지).
+    """
+    t = re.sub(r"\s+", " ", title.strip()).strip()
+    return t.casefold()
+
+
+def _dedup_consecutive_headings(md: str) -> str:
+    """연속(사이 공백 줄만) 동일제목 헤딩 중 뒤엣것을 제거. 무변경 시 원문 그대로.
+
+    중복 판정 = 다음 두 규칙의 OR(Advisor 지정, 2026-07-16 정정):
+      (a) 뒤 헤딩 B 가 '무번호'(선두 절번호 없음)이고, B 의 정규화 제목이 앞 헤딩 A
+          의 '절번호 제거 후' 정규화 제목과 같을 때(glm 편차 실측 케이스:
+          '## 3.2.3 SRAM X' 직후 '### SRAM X' 무번호 재출현).
+      (b) A·B 의 '원문 제목'(절번호 보존, 레벨만 무시)이 완전히 같을 때.
+      → 양쪽 모두 절번호가 있고 번호가 다르면(`1 Overview` vs `1.1 Overview`)
+        (a)는 B 유번호라 불성립, (b)는 원문(번호 포함)이 달라 불성립 → 절대 미제거.
+        (정당한 장/절 표제 동명 구조를 오제거하던 버그 수정.)
+
+    정책: 중복 판정된 헤딩 B 직전의 공백런은 통째로 버리고(선행 heading A 뒤의
+    빈 줄 관례를 그대로 보존), B 뒤의 공백런은 정상 경로로 보존 → 결과적으로
+    A 와 그다음 실제 콘텐츠 사이에는 항상 단일 공백줄만 남는다(중복 공백 방지).
+    코드펜스 내부·EOF 직전은 대상에서 제외.
+    """
+    if not md or not _heading_dedup_enabled():
+        return md
+    lines = md.split("\n")
+    n = len(lines)
+    out = []
+    i = 0
+    in_fence = False
+    removed = 0
+    while i < n:
+        line = lines[i]
+        if _MD_STYLE_FENCE_RE.match(line):
+            in_fence = not in_fence
+            out.append(line)
+            i += 1
+            continue
+        if in_fence:
+            out.append(line)
+            i += 1
+            continue
+        m = _HEADING_LINE_RE.match(line)
+        if not m:
+            out.append(line)
+            i += 1
+            continue
+        out.append(line)
+        anchor_title = m.group(2)
+        anchor_core_norm = _norm_heading_title(anchor_title)
+        anchor_raw_norm = _norm_heading_raw(anchor_title)
+        i += 1
+        # 사이 공백 줄만 두고 동일제목 헤딩이 체인으로 이어지면 전부 흡수.
+        while True:
+            j = i
+            while j < n and lines[j].strip() == "":
+                j += 1
+            if j >= n or _MD_STYLE_FENCE_RE.match(lines[j]):
+                break
+            m2 = _HEADING_LINE_RE.match(lines[j])
+            if not m2:
+                break
+            b_title = m2.group(2)
+            b_has_num = _heading_has_leading_number(b_title)
+            b_raw_norm = _norm_heading_raw(b_title)
+            is_dup = ((not b_has_num and anchor_core_norm == b_raw_norm)
+                      or (anchor_raw_norm == b_raw_norm))
+            if not is_dup:
+                break
+            removed += 1
+            i = j + 1
+    if removed:
+        print(f"    [MD-HEADDEDUP] 연속 동일제목 헤딩 {removed}건 제거", flush=True)
+        return "\n".join(out)
+    return md
+
+
 # ── F9: 불릿 정규화(FMDW_BULLET_LIST, 기본 ON) — 2026-07-09 ──────────────────────
 # 파이프라인이 리터럴 `•`/`–` 를 그대로 방출 → Markdown 에서 `•` 는 리스트 마커가 아니고
 # 빈 줄 없는 연속 라인은 한 문단으로 soft-wrap 병합돼 불릿이 가로로 붙어 렌더된다.
@@ -7668,6 +7780,9 @@ def process_file(input_path, output_dir_base):
         combined = _recover_missing_headings(combined, _pages_lines, _size2lvl)
         # F11(2026-07-11): 본문 크기 볼드 무번호 소제목을 `### ` 로 승격(F8 보완).
         combined = _promote_bold_subheadings(combined, _bold_labels)
+        # R13b(2026-07-16): 헤딩이 전부 확정된 시점 — 사이 공백 줄만 두고 재출현하는
+        #   연속 동일제목 헤딩(glm 런-투-런 편차) 제거. FMDW_HEADING_DEDUP=0 비활성.
+        combined = _dedup_consecutive_headings(combined)
         # F9(2026-07-09): 리터럴 `•`/`–` 불릿 → Markdown 리스트 정규화(가로붙음 방지).
         #   FMDW_BULLET_LIST=0 비활성. 코드펜스/표행 무변경.
         combined = _normalize_bullets(combined)
