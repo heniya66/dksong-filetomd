@@ -156,6 +156,80 @@ applied9b = "\n".join(qf.apply_fixes(list(lines9b), fixes9b))
 check("C10e qa_fix F4 SSoT matches extract_all_via_pdf on rule(b) case",
       applied9b == o9b, f"applied9b={applied9b!r} o9b={o9b!r}")
 
+# ── Case 11(R13c): doc_audit.py 의 _scan_heading_dup(검출 전용, SSoT 동치) ──
+da = importlib.import_module("doc_audit")
+
+dup11_1 = da._scan_heading_dup(md1.split("\n"))
+check("C11a doc_audit detects rule(a) duplicate heading (md1)",
+      len(dup11_1) == 1 and dup11_1[0][1] ==
+      "SRAM Design and Utility Levels CAD Layer Table", repr(dup11_1))
+
+dup11_2 = da._scan_heading_dup(md2.split("\n"))
+check("C11b doc_audit no false positive on different titles (md2)", dup11_2 == [])
+
+dup11_3 = da._scan_heading_dup(md3.split("\n"))
+check("C11c doc_audit no detect when content intervenes (md3)", dup11_3 == [])
+
+dup11_4 = da._scan_heading_dup(md4.split("\n"))
+check("C11d doc_audit ignores fenced pseudo-headings (md4)", dup11_4 == [])
+
+dup11_5 = da._scan_heading_dup(md5.split("\n"))
+check("C11e doc_audit no detect when page marker intervenes (md5)", dup11_5 == [])
+
+dup11_9 = da._scan_heading_dup(md9.split("\n"))
+check("C11f doc_audit SSoT: numbered chapter/section (different numbers) → no detect",
+      dup11_9 == [], repr(dup11_9))
+
+dup11_9b = da._scan_heading_dup(md9b.split("\n"))
+check("C11g doc_audit detects rule(b) exact-title-incl-number duplicate (md9b)",
+      len(dup11_9b) == 1 and dup11_9b[0][1] ==
+      "3.2.3 SRAM Design and Utility Levels CAD Layer Table", repr(dup11_9b))
+
+dup11_7 = da._scan_heading_dup(md7.split("\n"))
+check("C11h doc_audit chain of 3 → 2 duplicates detected (2nd/3rd)",
+      len(dup11_7) == 2, repr(dup11_7))
+
+# _page_of_line: 라인 인덱스 → 소속 페이지(마커 map 기반) 매핑 검증.
+mk_probe = {1: 0, 2: 5, 3: 12}
+check("C11i _page_of_line before first marker -> None",
+      da._page_of_line(mk_probe, -1) is None)
+check("C11j _page_of_line on/after marker -> owning page",
+      da._page_of_line(mk_probe, 0) == 1
+      and da._page_of_line(mk_probe, 4) == 1
+      and da._page_of_line(mk_probe, 5) == 2
+      and da._page_of_line(mk_probe, 20) == 3)
+
+# ── Case 12(R13c): doc_audit.py 전체 실행 — heading_dup WARN 채널 스모크 ──
+#    ①합성 중복헤딩 MD(가짜 페이지마커 포함, PDF 없이 함수 직접 호출로 대체는
+#      이미 C11 커버) ②확정본(DM_p0018-0047)은 이미 R13b 로 정리된 산출물이므로
+#      heading_dup 0·기존 status CLEAN 유지가 기대값(회귀 가드).
+import json
+import subprocess
+import sys as _sys
+from pathlib import Path as _Path
+
+BASE_DIR = _Path(__file__).parent
+md_confirmed = BASE_DIR / "output" / "pdf_md" / "DM_p0018-0047.md"
+pdf_confirmed = BASE_DIR / "input" / "pdf" / "DM_p0018-0047.pdf"
+if md_confirmed.exists() and pdf_confirmed.exists():
+    r = subprocess.run(
+        [_sys.executable, str(BASE_DIR / "doc_audit.py"),
+         str(md_confirmed), str(pdf_confirmed)],
+        capture_output=True, text=True)
+    out = r.stdout
+    out = out[out.index("{"):] if "{" in out else "{}"
+    d = json.loads(out)
+    check("C12a confirmed doc doc_audit exit code unchanged (0=CLEAN)",
+          r.returncode == 0, f"returncode={r.returncode}")
+    check("C12b confirmed doc status still CLEAN (heading_dup WARN is non-blocking)",
+          d.get("status") == "CLEAN", repr(d.get("status")))
+    check("C12c confirmed doc has 0 heading_dup warns (already R13b-clean)",
+          d.get("warn_summary", {}).get("heading_dup", 0) == 0,
+          repr(d.get("warn_summary")))
+else:
+    check("C12 confirmed doc fixtures present (skipped if absent)", True,
+          "skipped: md/pdf fixture missing")
+
 print("\n=== SUMMARY ===")
 passed = sum(1 for _, c in results if c)
 print(f"{passed}/{len(results)} checks passed")

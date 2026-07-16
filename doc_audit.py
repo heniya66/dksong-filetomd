@@ -49,6 +49,98 @@ SEP_RE = re.compile(r"^\s*\|[\s:|\-]+\|\s*$")
 HEAD_RE = re.compile(r"^\s*#{1,6}\s+\S")
 
 
+# ── R13c(2026-07-16): heading_dup WARN 검출용 — qa_fix.py `scan_heading_dedup` /
+#    extract_all_via_pdf.py `_dedup_consecutive_headings` 와 자구 동치(SSoT).
+#    doc_audit 는 독립 실행 파일(단일 프로세스, import 의존 최소)이라 함수를
+#    복제한다(재구현이 아니라 이식 — 규칙 변경 시 3곳 동시 갱신 필요, 출처 명시).
+HD_FENCE_RE = re.compile(r"^\s*(```|~~~)")
+HD_HEADING_LINE_RE = re.compile(r"^(#{1,6})\s+(\S.*)$")
+HD_LEADING_SECTION_NUM_RE = re.compile(r"^\d+(?:\.\d+)*\s+")
+
+
+def _hd_has_leading_number(title):
+    """제목 선두에 절 번호(`N.N.N `) 토큰이 있는지 여부."""
+    return bool(HD_LEADING_SECTION_NUM_RE.match((title or "").strip()))
+
+
+def _hd_norm_title(title):
+    """헤딩 제목 정규화(절번호 제거판) — 규칙(a)(뒤 헤딩이 무번호일 때만) 용."""
+    t = (title or "").strip()
+    t = HD_LEADING_SECTION_NUM_RE.sub("", t, count=1)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t.casefold()
+
+
+def _hd_norm_raw(title):
+    """헤딩 제목 정규화(절번호 보존판) — 규칙(b)(원문 완전동일) 용."""
+    t = re.sub(r"\s+", " ", (title or "").strip()).strip()
+    return t.casefold()
+
+
+def _scan_heading_dup(lines):
+    """연속(사이 공백 줄만) 동일제목 헤딩을 검출(수정하지 않음, 검출 전용).
+
+    중복 판정 = 규칙(a) OR 규칙(b)(R13b 최종본과 자구 동치):
+      (a) 뒤 헤딩 B 가 무번호이고 그 정규화 제목이 앞 헤딩 A 의 절번호 제거 후
+          정규화 제목과 같을 때.
+      (b) A·B 의 원문 제목(절번호 보존, 레벨만 무시)이 완전히 같을 때.
+      → 양쪽 다 번호가 있고 번호가 다르면(`1 Overview` vs `1.1 Overview`) 미검출.
+    코드펜스 내부·헤딩 사이 비공백 내용(페이지 마커 포함) 개재 시 미검출.
+
+    반환: [(line_idx(0-based, 뒤엣것 B), b_title), ...]
+    """
+    found = []
+    n = len(lines)
+    in_fence = False
+    i = 0
+    while i < n:
+        if HD_FENCE_RE.match(lines[i]):
+            in_fence = not in_fence
+            i += 1
+            continue
+        if in_fence:
+            i += 1
+            continue
+        m = HD_HEADING_LINE_RE.match(lines[i])
+        if not m:
+            i += 1
+            continue
+        anchor_title = m.group(2)
+        anchor_core = _hd_norm_title(anchor_title)
+        anchor_raw = _hd_norm_raw(anchor_title)
+        i += 1
+        while True:
+            j = i
+            while j < n and lines[j].strip() == "":
+                j += 1
+            if j >= n or HD_FENCE_RE.match(lines[j]):
+                break
+            m2 = HD_HEADING_LINE_RE.match(lines[j])
+            if not m2:
+                break
+            b_title = m2.group(2)
+            b_has_num = _hd_has_leading_number(b_title)
+            b_raw = _hd_norm_raw(b_title)
+            is_dup = ((not b_has_num and anchor_core == b_raw)
+                      or (anchor_raw == b_raw))
+            if not is_dup:
+                break
+            found.append((j, b_title))
+            i = j + 1
+    return found
+
+
+def _page_of_line(mk, li):
+    """라인 인덱스(0-based)가 속한 페이지 번호(첫 마커 이전 라인은 None)."""
+    p = None
+    for pg, idx in sorted(mk.items(), key=lambda kv: kv[1]):
+        if idx <= li:
+            p = pg
+        else:
+            break
+    return p
+
+
 USAGE = ("usage: .venv/bin/python doc_audit.py <md_path> <pdf_path>\n"
          "       (검사 항목·해석은 --help 참조. exit 0=CLEAN, 1=FAIL, 2=실행 오류)")
 
@@ -93,6 +185,18 @@ def main():
 
     def warn(check, page, detail):
         warns.append({"check": check, "page": page, "detail": detail})
+
+    # ── heading_dup(R13c) WARN: 연속 동일제목 헤딩 잔존 검출 ──
+    #    R13b(extract `_dedup_consecutive_headings`)의 예방 게이트에 대응하는 검출
+    #    게이트 — Goose QA 체인(qa_scan+doc_audit+cross_verify)이 이 결함 유형을
+    #    인식하도록 가시화. 비차단(경고 채널, status/exit code 불변). SSoT = 위
+    #    _scan_heading_dup(qa_fix.py `scan_heading_dedup` 과 자구 동치).
+    try:
+        for (li, b_title) in _scan_heading_dup(lines):
+            warn("heading_dup", _page_of_line(mk, li),
+                 f"consecutive duplicate heading: '{b_title[:70]}'")
+    except Exception as e4:  # noqa: BLE001 — 비차단(경고 채널)
+        warn("heading_dup", None, f"heading_dup scan error: {e4}")
 
     # ── f_coverage ──
     missing_mk = [p for p in range(1, npages + 1) if p not in mk]
